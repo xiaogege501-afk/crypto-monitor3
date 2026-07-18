@@ -15,6 +15,8 @@ LEVEL_COLOR = {
     "neutral": "gray",
 }
 
+saved = core.load_user_config()
+
 
 def render_watchlist_row(r, show_whale=False):
     if "error" in r:
@@ -46,13 +48,43 @@ def render_watchlist_row(r, show_whale=False):
 def get_overview():
     return core.get_market_overview()
 
+@st.cache_data(ttl=1800)
+def get_fed_overview(fred_key):
+    return core.get_fed_overview(fred_key)
+
 ov = get_overview()
-oc1, oc2, oc3 = st.columns(3)
+fed = get_fed_overview(saved.get("fred_key", ""))
+
+oc1, oc2, oc3, oc4 = st.columns(4)
 if ov.get("btc_dominance") is not None:
     oc1.metric("BTC 市占率", f"{ov['btc_dominance']:.1f}%")
 if ov.get("fng_value") is not None:
     oc2.metric("恐慌贪婪指数", f"{ov['fng_value']}", ov.get("fng_label"))
-oc3.caption("💡 恐慌区间历史上常伴随阶段性底部，贪婪区间需警惕追高风险，仅供参考")
+
+rate = fed["rate"]
+oc3.metric("联邦基金利率目标区间", f"{rate['lower']:.2f}%–{rate['upper']:.2f}%")
+oc3.caption(f"数据日期 {rate['as_of']}" + ("" if rate["live"] else "　（未接入实时数据）"))
+
+meeting = fed["meeting"]
+if meeting:
+    oc4.metric("距下次议息会议", f"{meeting['days_until']} 天", f"{meeting['start']} ~ {meeting['end']}")
+else:
+    oc4.warning("今年FOMC会议日程已用完，需要更新明年日程，告诉我一声我帮你更新")
+
+st.caption("💡 恐慌区间历史上常伴随阶段性底部，贪婪区间需警惕追高风险；议息会议前后市场波动通常会放大，仅供参考")
+
+risk_signal = fed["risk_signal"]
+if risk_signal["available"]:
+    bias_color = {"偏多": "green", "偏空": "red", "中性": "gray"}.get(risk_signal["bias"], "gray")
+    st.markdown(f"**利率驱动的风险市场参考信号**：:{bias_color}[{risk_signal['trend']}，{risk_signal['bias']}]")
+    for reason in risk_signal["reasons"]:
+        st.caption(f"• {reason}")
+else:
+    st.markdown("**利率驱动的风险市场参考框架**")
+    st.caption(risk_signal["note"])
+    for line in risk_signal.get("framework", []):
+        st.caption(f"• {line}")
+
 st.divider()
 
 with st.sidebar:
@@ -61,42 +93,64 @@ with st.sidebar:
     st.subheader("👀 关注加密货币")
     st.caption("每行一个，支持直接写代号/名称（如 xrp、sui），会自动识别")
     watchlist_text = st.text_area(
-        "币种列表", value="bitcoin\nethereum\nsolana\nxrp\nsui", height=120, label_visibility="collapsed"
+        "币种列表", value=saved.get("watchlist_text", "bitcoin\nethereum\nsolana\nxrp\nsui"),
+        height=120, label_visibility="collapsed"
     )
     watchlist = [c.strip() for c in watchlist_text.splitlines() if c.strip()]
-    show_whale_watchlist = st.checkbox("同时查持仓集中度(巨鲸信号)", value=True,
+    show_whale_watchlist = st.checkbox("同时查持仓集中度(巨鲸信号)", value=saved.get("show_whale_watchlist", True),
                                         help="仅覆盖以太坊/BSC/Base/Arbitrum/Polygon 上的代币")
 
     st.divider()
     st.subheader("💱 关注外汇货币对")
     st.caption("每行一个，格式：基准货币/计价货币，如 USD/JPY")
     forex_text = st.text_area(
-        "货币对列表", value="USD/JPY\nEUR/USD\nGBP/USD", height=100, label_visibility="collapsed"
+        "货币对列表", value=saved.get("forex_text", "USD/JPY\nEUR/USD\nGBP/USD"),
+        height=100, label_visibility="collapsed"
     )
     forex_watchlist = [p.strip() for p in forex_text.splitlines() if p.strip()]
 
     st.divider()
     st.subheader("🚀 新币扫描阈值")
-    min_liquidity = st.number_input("最低流动性(USD)", value=30000, step=5000)
-    min_volume = st.number_input("最低24h成交量(USD)", value=100000, step=10000)
-    min_change_1h = st.number_input("最低1h涨幅(%)", value=20, step=5)
+    min_liquidity = st.number_input("最低流动性(USD)", value=saved.get("min_liquidity", 30000), step=5000)
+    min_volume = st.number_input("最低24h成交量(USD)", value=saved.get("min_volume", 100000), step=10000)
+    min_change_1h = st.number_input("最低1h涨幅(%)", value=saved.get("min_change_1h", 20), step=5)
     chains = st.multiselect(
         "监控的链",
         ["solana", "ethereum", "base", "bsc", "arbitrum", "polygon"],
-        default=["solana", "ethereum", "base"],
+        default=saved.get("chains", ["solana", "ethereum", "base"]),
     )
-    run_security_check = st.checkbox("安全检测(GoPlus)", value=True)
-    run_background = st.checkbox("生成背景与投资价值分析", value=True)
+    run_security_check = st.checkbox("安全检测(GoPlus)", value=saved.get("run_security_check", True))
+    run_background = st.checkbox("生成背景与投资价值分析", value=saved.get("run_background", True))
 
     st.divider()
     st.subheader("🐋 巨鲸钱包监控")
     st.caption("需要免费的 Etherscan API Key：etherscan.io/myapikey")
-    etherscan_key = st.text_input("Etherscan API Key", type="password")
+    etherscan_key = st.text_input("Etherscan API Key", value=saved.get("etherscan_key", ""), type="password")
     st.caption("每行一个：链,地址,备注（备注可省略）")
     wallets_text = st.text_area(
-        "监控地址", value="", height=100, label_visibility="collapsed",
+        "监控地址", value=saved.get("wallets_text", ""), height=100, label_visibility="collapsed",
         placeholder="ethereum,0xAbC...,某巨鲸"
     )
+
+    st.divider()
+    st.subheader("🏦 美联储利率（可选）")
+    st.caption("免费Key：fred.stlouisfed.org/docs/api/api_key.html，不填也能看会议倒计时，只是利率不实时")
+    fred_key = st.text_input("FRED API Key", value=saved.get("fred_key", ""), type="password")
+
+    st.divider()
+    if st.button("💾 保存当前设置", type="primary", use_container_width=True):
+        cfg = {
+            "watchlist_text": watchlist_text, "forex_text": forex_text,
+            "show_whale_watchlist": show_whale_watchlist,
+            "min_liquidity": min_liquidity, "min_volume": min_volume, "min_change_1h": min_change_1h,
+            "chains": chains, "run_security_check": run_security_check, "run_background": run_background,
+            "etherscan_key": etherscan_key, "wallets_text": wallets_text, "fred_key": fred_key,
+        }
+        if core.save_user_config(cfg):
+            st.success("已保存，下次打开会自动填充")
+        else:
+            st.error("保存失败（可能是部署环境没有写入权限），换个平台部署或者每次手动填一下")
+    st.caption("⚠️ 保存在服务器本地文件里；如果你重新推送代码触发平台重新构建，需要重新保存一次")
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
     ["👀 加密货币关注", "💱 外汇关注", "🚀 新币动量扫描", "🐋 巨鲸监控", "📈 信号回测", "📰 每日报告"]
@@ -293,7 +347,7 @@ with tab6:
 
     if st.button("📰 生成今日报告", type="primary"):
         report_candidates = st.session_state.get("candidates", [])
-        report_text = core.generate_daily_report(watchlist_results, forex_results, report_candidates, ov)
+        report_text = core.generate_daily_report(watchlist_results, forex_results, report_candidates, ov, fed)
         st.session_state["daily_report"] = report_text
 
     if st.session_state.get("daily_report"):

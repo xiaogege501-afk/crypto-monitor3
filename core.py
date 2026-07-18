@@ -4,6 +4,7 @@
 """
 import time
 import datetime
+import json
 import requests
 
 DEXSCREENER_PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
@@ -16,6 +17,8 @@ COINGECKO_GLOBAL_URL = "https://api.coingecko.com/api/v3/global"
 FEAR_GREED_URL = "https://api.alternative.me/fng/"
 FRANKFURTER_URL = "https://api.frankfurter.app"
 ETHERSCAN_V2_URL = "https://api.etherscan.io/v2/api"
+FRED_URL = "https://api.stlouisfed.org/fred/series/observations"
+CONFIG_PATH = "user_config.json"
 
 # 链名 -> GoPlus 需要的数字 chain_id（覆盖常见 EVM 链）
 GOPLUS_CHAIN_MAP = {
@@ -34,6 +37,151 @@ CG_PLATFORM_MAP = {
     "arbitrum-one": "arbitrum",
     "polygon-pos": "polygon",
 }
+
+# 2026年FOMC议息会议日期（美联储官网公布的固定日程，每年年初会公布下一年的完整日程）
+# 到了2027年需要更新这个列表，我会到时候提醒你
+FOMC_MEETINGS_2026 = [
+    ("2026-01-27", "2026-01-28"),
+    ("2026-03-17", "2026-03-18"),
+    ("2026-04-28", "2026-04-29"),
+    ("2026-06-16", "2026-06-17"),
+    ("2026-07-28", "2026-07-29"),
+    ("2026-09-15", "2026-09-16"),
+    ("2026-10-27", "2026-10-28"),
+    ("2026-12-08", "2026-12-09"),
+]
+
+
+# ========== 本地设置持久化：保存/读取你填入的Key、关注列表等 ==========
+# 保存在部署环境自己的文件系统里，不会上传到 GitHub（.gitignore 已排除）
+# 注意：Streamlit Cloud / Hugging Face Spaces 的免费额度下，只要应用不重新构建
+# （没有push新代码、没有平台侧的重启清空），这个文件就会一直保留；
+# 一旦重新构建（比如你更新了代码），文件会被清空，需要重新保存一次
+
+def save_user_config(config: dict, path=CONFIG_PATH):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def load_user_config(path=CONFIG_PATH):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+# ========== 美联储利率 + 议息会议倒计时 ==========
+
+def get_next_fomc_meeting(today=None):
+    today = today or datetime.date.today()
+    for start, end in FOMC_MEETINGS_2026:
+        end_date = datetime.date.fromisoformat(end)
+        if end_date >= today:
+            start_date = datetime.date.fromisoformat(start)
+            days_until = (start_date - today).days
+            return {"start": start, "end": end, "days_until": max(days_until, 0)}
+    return None  # 今年的会议都开完了，需要更新下一年的日程
+
+
+def fetch_fed_funds_rate(fred_api_key=None):
+    """联邦基金利率目标区间。填入免费的 FRED API Key（fred.stlouisfed.org/docs/api/api_key.html）
+    可以拿到实时数据；不填就显示一份写死的静态快照并标注日期，可能不是最新的"""
+    if not fred_api_key:
+        return {"upper": 3.75, "lower": 3.50, "as_of": "2026-06-17（静态快照，填FRED Key可实时更新）", "live": False}
+
+    def get_latest(series_id):
+        params = {"series_id": series_id, "api_key": fred_api_key, "file_type": "json",
+                   "sort_order": "desc", "limit": 1}
+        resp = requests.get(FRED_URL, params=params, timeout=15)
+        resp.raise_for_status()
+        obs = resp.json()["observations"][0]
+        return float(obs["value"]), obs["date"]
+
+    try:
+        upper, date_u = get_latest("DFEDTARU")
+        lower, _ = get_latest("DFEDTARL")
+        return {"upper": upper, "lower": lower, "as_of": date_u, "live": True}
+    except Exception:
+        return {"upper": 3.75, "lower": 3.50, "as_of": "获取失败，显示静态快照", "live": False}
+
+
+def fetch_fed_rate_series(fred_api_key, limit=250):
+    """拉取联邦基金利率目标上限的历史序列，按日期从新到旧排列"""
+    params = {"series_id": "DFEDTARU", "api_key": fred_api_key, "file_type": "json",
+              "sort_order": "desc", "limit": limit}
+    resp = requests.get(FRED_URL, params=params, timeout=15)
+    resp.raise_for_status()
+    obs = resp.json()["observations"]
+    return [(o["date"], float(o["value"])) for o in obs if o.get("value") not in (".", None)]
+
+
+def get_rate_risk_signal(fred_api_key=None):
+    """根据利率趋势（降息/加息/持平）给一个"风险市场偏多偏空"的参考框架
+    这是宏观流动性层面的粗略经验规律，不是精确预测，具体行情还受很多其他因素影响"""
+    if not fred_api_key:
+        return {
+            "available": False,
+            "note": "填入FRED Key后可以看到基于利率趋势的实时参考信号；没填的时候先给你一个通用判断框架：",
+            "framework": [
+                "利率下行（降息周期）：融资成本降低、流动性转松，历史上通常对加密货币、成长股这类风险资产偏正面；"
+                "但如果降息是因为经济数据明显走弱触发的'衰退式降息'，市场可能先跌后涨，不是看到降息就无脑做多",
+                "利率上行（加息周期）：融资成本上升，市场风险偏好通常收缩，历史上对高波动资产压力较大",
+                "利率持平：市场更多交易会议声明和点阵图释放的未来预期信号，而不是当前利率水平本身",
+            ],
+        }
+
+    try:
+        series = fetch_fed_rate_series(fred_api_key)
+    except Exception as e:
+        return {"available": False, "note": f"获取利率历史失败: {e}"}
+
+    if len(series) < 2:
+        return {"available": False, "note": "利率历史数据不足，暂时无法判断趋势"}
+
+    latest_date, latest_rate = series[0]
+    target_date = datetime.date.fromisoformat(latest_date) - datetime.timedelta(days=180)
+    past_rate = next((r for d, r in series if datetime.date.fromisoformat(d) <= target_date), series[-1][1])
+
+    diff = latest_rate - past_rate
+
+    if diff <= -0.2:
+        trend, bias = "降息周期", "偏多"
+        reasons = [
+            f"过去约180天利率从 {past_rate:.2f}% 降至 {latest_rate:.2f}%，处于降息周期",
+            "融资成本下降、流动性转松，历史上通常对加密货币、成长股这类风险资产偏正面",
+            "但需留意：如果这轮降息是被经济数据走弱推动的'衰退式降息'，市场可能先跌后涨，"
+            "不能只看到降息就无脑做多，要结合当时的经济数据背景一起看",
+        ]
+    elif diff >= 0.2:
+        trend, bias = "加息周期", "偏空"
+        reasons = [
+            f"过去约180天利率从 {past_rate:.2f}% 升至 {latest_rate:.2f}%，处于加息周期",
+            "融资成本上升，市场风险偏好通常收缩，历史上对高波动的加密货币、成长股压力较大",
+        ]
+    else:
+        trend, bias = "利率持平", "中性"
+        reasons = [
+            f"过去约180天利率维持在 {min(past_rate, latest_rate):.2f}%~{max(past_rate, latest_rate):.2f}% 区间，没有明显趋势",
+            "这种阶段市场更多交易的是会议声明和未来预期信号（比如点阵图释放的降息/加息暗示），而不是当前利率水平本身",
+        ]
+
+    return {
+        "available": True, "trend": trend, "bias": bias,
+        "current_rate": latest_rate, "past_rate": past_rate, "reasons": reasons,
+    }
+
+
+def get_fed_overview(fred_api_key=None):
+    return {
+        "meeting": get_next_fomc_meeting(),
+        "rate": fetch_fed_funds_rate(fred_api_key),
+        "risk_signal": get_rate_risk_signal(fred_api_key),
+    }
 
 
 # ========== 市场概览：大盘温度计 ==========
@@ -404,7 +552,7 @@ def backtest_forex(pair, forward_days=7, days=365):
 # ========== 每日报告：把当前所有数据汇总成一份文字摘要 ==========
 # 完全由规则拼接生成，不调用任何AI模型，免费、确定性、不会"编造"内容
 
-def generate_daily_report(watchlist_results, forex_results, new_coin_candidates, overview):
+def generate_daily_report(watchlist_results, forex_results, new_coin_candidates, overview, fed_overview=None):
     today = datetime.date.today().strftime("%Y年%m月%d日")
     lines = [f"### 📅 {today} 市场速览\n"]
 
@@ -412,6 +560,14 @@ def generate_daily_report(watchlist_results, forex_results, new_coin_candidates,
         lines.append(f"**市场情绪**：恐慌贪婪指数 {overview['fng_value']}（{overview['fng_label']}）")
     if overview.get("btc_dominance") is not None:
         lines.append(f"**BTC市占率**：{overview['btc_dominance']:.1f}%")
+
+    if fed_overview:
+        meeting = fed_overview.get("meeting")
+        if meeting:
+            lines.append(f"**距下次FOMC议息会议**：{meeting['days_until']}天（{meeting['start']}~{meeting['end']}）")
+        risk_signal = fed_overview.get("risk_signal")
+        if risk_signal and risk_signal.get("available"):
+            lines.append(f"**利率驱动的风险市场信号**：{risk_signal['trend']}，{risk_signal['bias']}")
 
     def group_by_bias(results):
         bullish = [r for r in results if not r.get("error") and r.get("level") in ("buy", "watch_buy")]
