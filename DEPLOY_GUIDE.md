@@ -1,0 +1,80 @@
+# 加密货币 & 外汇投资监控看板 —— 系统说明 + 免费部署完整教程
+
+## 一、这套系统是什么，能做什么
+
+一个纯免费、部署在网页上的个人投资信息助手，打开网址随时看，不需要你告诉它持仓，
+只根据公开数据做技术面提示，辅助你自己判断买卖时机。一共 6 个功能模块：
+
+| 标签页 | 功能 |
+|---|---|
+| 👀 加密货币关注 | 输入你关心的币（支持直接打代号如 xrp、sui），显示现价、涨跌幅，并基于 RSI、均线给出"关注买入区/偏空/中性"提示 + 具体理由，同时显示该币前10大地址的持仓集中度（巨鲸筹码信号） |
+| 💱 外汇关注 | 同样的技术面打分逻辑用在外汇货币对上（如 USD/JPY、EUR/USD），数据源是欧洲央行免费汇率 |
+| 🚀 新币动量扫描 | 挖掘刚启动、涨幅异常的新币，按"涨幅+换手强度+买卖力量"综合评分排序，附带项目背景简介、社交链接、合约安全检测 |
+| 🐋 巨鲸监控 | 输入你关注的巨鲸钱包地址，查看最近的代币转入/转出活动流水（客观展示，不自动判断买卖方向，避免误导） |
+| 📈 信号回测 | 把现在用的打分规则套用到过去一年的真实历史价格上，统计"这个信号出现后未来N天真实涨跌概率"，验证规则靠不靠谱 |
+| 📰 每日报告 | 一键把当前几个模块已加载的数据拼成一份文字摘要，快速过一遍全貌 |
+
+顶部还有一个市场概览：BTC市占率 + 恐慌贪婪指数，帮你判断当前大盘情绪。
+
+全部数据源都是免费公开API（CoinGecko、DexScreener、GoPlus Security、欧洲央行、
+alternative.me），除了"巨鲸监控"需要你自己申请一个免费的 Etherscan API Key 之外，
+其余模块打开就能用，不需要任何配置。
+
+**再次强调**：所有提示都是基于公开技术指标的规则打分，不是预测，更不构成投资建议，
+最终买卖决策需要你自己判断。
+
+---
+
+## 二、部署教程（全程免费，大概20分钟）
+
+### 第一步：把代码传到 GitHub
+
+1. 没有 GitHub 账号先注册：https://github.com/signup（免费）
+2. 新建一个仓库，比如叫 `crypto-monitor`，建议选 **Private**（私有）
+3. 把这个代码包里的文件全部上传：`core.py`、`streamlit_app.py`、`app.py`、
+   `requirements.txt`、`.gitignore`
+   - 网页上传最简单：进入仓库页面点 `Add file → Upload files`，把文件拖进去，点 `Commit changes`
+   - 如果之前已经建过仓库，这次只需要把这几个文件重新上传一遍覆盖旧版本即可
+
+### 第二步：部署成网页（二选一）
+
+**方案A：Streamlit Community Cloud**（如果你之前已经用 GitHub 登录成功过，直接用这个）
+
+1. 打开 https://share.streamlit.io，用 GitHub 账号登录
+2. 点 `New app` → 选择仓库 `crypto-monitor` → 分支选 `main`
+3. Main file path 填 `streamlit_app.py`
+4. 点 `Deploy`，等 1-2 分钟
+
+**方案B：Hugging Face Spaces**（如果方案A登录一直报错，用这个代替，不走GitHub登录）
+
+1. 打开 https://huggingface.co/join 免费注册（邮箱即可）
+2. 打开 https://huggingface.co/new-space 创建 Space：
+   SDK 选 Streamlit（没有就选 Docker → 下一步选 Streamlit 模板），Hardware 选免费 CPU
+3. 上传 `app.py`、`core.py`、`requirements.txt` 三个文件（HF 默认识别的入口文件名是 `app.py`）
+4. 等 1-2 分钟自动构建
+
+### 第三步：以后随时打开
+
+部署成功后你会拿到一个固定网址，形如：
+- Streamlit Cloud: `https://你的名字-crypto-monitor-xxxxx.streamlit.app`
+- Hugging Face: `https://你的用户名-crypto-monitor.hf.space`
+
+**建议做的事**：
+- 把这个网址加到手机浏览器主屏幕（iOS：分享→添加到主屏幕；Android：菜单→添加到主屏幕），
+  以后像打开App一样一键打开，不用记网址
+- 长时间没访问会"休眠"，重新打开需要等十几秒唤醒，这是免费额度的正常现象，等一下就好
+
+---
+
+## 三、以后代码更新了怎么办
+
+以后我帮你继续优化功能，改动的文件会重新发给你，你只需要：
+1. 去 GitHub 仓库把对应文件重新上传覆盖（文件名保持一致）
+2. Streamlit Cloud / Hugging Face Space 会自动检测到更新，自动重新构建，1-2分钟后新版本生效
+3. 打开网页刷新一下就行，不需要重新走一遍部署流程
+
+## 四、遇到问题怎么排查
+
+- 网页打不开/报错 → Streamlit Cloud 在应用页面点 `Manage app` 看日志；
+  Hugging Face 在 Space 页面点 `Logs` 标签看日志
+- 某个免费 API 突然大量报错 → 大概率是官方接口调整了，把报错内容发给我，我帮你改代码
