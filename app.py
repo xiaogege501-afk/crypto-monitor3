@@ -39,7 +39,13 @@ def render_watchlist_row(r, show_whale=False):
         f"**{r['coin'].upper()}**　`{r['price']:,.4f}`　"
         f"24h {r['change_24h']:+.1f}%　{change7}　:{LEVEL_COLOR.get(r['level'],'gray')}[{r['label']}]"
     )
-    st.caption(f"理由：{reason_line}{whale_line}")
+    st.caption(f"技术面理由：{reason_line}{whale_line}")
+
+    deriv = r.get("derivatives")
+    if deriv:
+        bias_icon = {"overheat": "⚠️", "washout": "💡", "risk": "🟠", "neutral": "⚪"}.get(deriv["bias"], "")
+        st.caption(f"{bias_icon} 杠杆情绪：{'　'.join(deriv['reasons'])}")
+
     st.divider()
 
 
@@ -108,6 +114,8 @@ with st.sidebar:
     watchlist = [c.strip() for c in watchlist_text.splitlines() if c.strip()]
     show_whale_watchlist = st.checkbox("同时查持仓集中度(巨鲸信号)", value=saved.get("show_whale_watchlist", True),
                                         help="仅覆盖以太坊/BSC/Base/Arbitrum/Polygon 上的代币")
+    show_derivatives = st.checkbox("同时查杠杆情绪(资金费率+未平仓合约)", value=saved.get("show_derivatives", True),
+                                    help="数据源Binance合约，免费不需要key；只覆盖有合约上架的币种，小市值新币可能没有")
 
     st.divider()
     st.subheader("💱 关注外汇货币对")
@@ -151,7 +159,7 @@ with st.sidebar:
         cfg = {
             "cg_key": cg_key,
             "watchlist_text": watchlist_text, "forex_text": forex_text,
-            "show_whale_watchlist": show_whale_watchlist,
+            "show_whale_watchlist": show_whale_watchlist, "show_derivatives": show_derivatives,
             "min_liquidity": min_liquidity, "min_volume": min_volume, "min_change_1h": min_change_1h,
             "chains": chains, "run_security_check": run_security_check, "run_background": run_background,
             "etherscan_key": etherscan_key, "wallets_text": wallets_text, "fred_key": fred_key,
@@ -168,21 +176,22 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
 
 # ---------- Tab 1: 加密货币关注 ----------
 with tab1:
-    st.caption("基于 RSI、均线等技术指标做规则打分，仅供参考，不构成投资建议")
+    st.caption("基于 RSI、EMA20/50/200多周期结构、MACD、RSI背离 做多因子技术面打分，加上Binance合约的杠杆情绪，仅供参考，不构成投资建议")
 
     if st.button("🔄 刷新分析", key="refresh_watchlist"):
         st.cache_data.clear()
 
     @st.cache_data(ttl=120)
-    def get_watchlist_analysis(coin_ids, include_whale, cg_key_):
-        return core.analyze_watchlist(coin_ids, include_whale=include_whale, cg_api_key=cg_key_)
+    def get_watchlist_analysis(coin_ids, include_whale, cg_key_, include_deriv):
+        return core.analyze_watchlist(coin_ids, include_whale=include_whale, cg_api_key=cg_key_,
+                                       include_derivatives=include_deriv)
 
     if not watchlist:
         st.info("请在左侧输入你想关注的币种")
         watchlist_results = []
     else:
         with st.spinner("正在获取数据并计算指标..."):
-            watchlist_results = get_watchlist_analysis(tuple(watchlist), show_whale_watchlist, cg_key)
+            watchlist_results = get_watchlist_analysis(tuple(watchlist), show_whale_watchlist, cg_key, show_derivatives)
         for r in watchlist_results:
             render_watchlist_row(r, show_whale=show_whale_watchlist)
 

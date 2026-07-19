@@ -18,6 +18,8 @@ FEAR_GREED_URL = "https://api.alternative.me/fng/"
 FRANKFURTER_URL = "https://api.frankfurter.app"
 ETHERSCAN_V2_URL = "https://api.etherscan.io/v2/api"
 FRED_URL = "https://api.stlouisfed.org/fred/series/observations"
+BINANCE_FAPI = "https://fapi.binance.com/fapi/v1"
+BINANCE_FUTURES_DATA = "https://fapi.binance.com/futures/data"
 CONFIG_PATH = "user_config.json"
 
 # 链名 -> GoPlus 需要的数字 chain_id（覆盖常见 EVM 链）
@@ -332,6 +334,60 @@ def compute_ma(prices, window):
     return sum(prices[-window:]) / window
 
 
+def compute_ema_series(prices, period):
+    """指数移动平均的完整序列（不是只返回最新值），因为判断"金叉/死叉"
+    需要比较最新值和前一个值，只算一个数字不够用"""
+    if len(prices) < period:
+        return []
+    k = 2 / (period + 1)
+    series = [sum(prices[:period]) / period]  # 用简单均线做种子
+    for p in prices[period:]:
+        series.append(p * k + series[-1] * (1 - k))
+    return series
+
+
+def compute_macd(prices, fast=12, slow=26, signal=9):
+    """标准MACD：DIF(快慢EMA差) + DEA(DIF的EMA) + 柱状图(DIF-DEA)
+    返回最新一期和上一期的柱状图数值，用来判断"由负转正"这种转折"""
+    if len(prices) < slow + signal + 2:
+        return None
+    fast_series = compute_ema_series(prices, fast)
+    slow_series = compute_ema_series(prices, slow)
+    offset = len(fast_series) - len(slow_series)
+    if offset < 0:
+        return None
+    dif_series = [f - s for f, s in zip(fast_series[offset:], slow_series)]
+    if len(dif_series) < signal + 2:
+        return None
+    dea_series = compute_ema_series(dif_series, signal)
+    dif_offset = len(dif_series) - len(dea_series)
+    hist_series = [d - e for d, e in zip(dif_series[dif_offset:], dea_series)]
+    if len(hist_series) < 2:
+        return None
+    return {"hist": hist_series[-1], "prev_hist": hist_series[-2], "dif": dif_series[-1], "dea": dea_series[-1]}
+
+
+def detect_divergence(prices, lookback=14):
+    """简化版RSI背离检测：
+    价格创近期新低但RSI没有跟着创新低 -> 底背离(卖压减弱，可能反转向上)
+    价格创近期新高但RSI没有跟着创新高 -> 顶背离(上涨动能减弱，可能反转向下)
+    这是简化实现（用区间起止点比较，不是完整的波峰波谷算法），仅供参考"""
+    if len(prices) < lookback + 15:
+        return None
+
+    price_then, price_now = prices[-lookback], prices[-1]
+    rsi_then = compute_rsi(prices[: len(prices) - lookback + 1], 14)
+    rsi_now = compute_rsi(prices, 14)
+    if rsi_then is None or rsi_now is None:
+        return None
+
+    if price_now < price_then and rsi_now > rsi_then:
+        return "bullish"
+    if price_now > price_then and rsi_now < rsi_then:
+        return "bearish"
+    return None
+
+
 def get_concentration_info(chain, address):
     """用 GoPlus 查持仓集中度（前10大地址占比、持有人数），作为"巨鲸集中度"信号
     只覆盖常见 EVM 链，其余链返回 None"""
@@ -379,8 +435,9 @@ def get_watchlist_whale_info(coin_id, cg_api_key=None):
 
 def compute_signal(prices, extra_rules=True):
     """给定一段按时间正序排列的价格序列（最后一个视为"当前"价格），
-    计算 RSI/均线打分，返回 dict。这是关注币种实时分析和历史回测共用的核心打分逻辑，
-    保证"现在看到的提示"和"回测验证的规则"是同一套代码，不会两边逻辑不一致"""
+    综合 RSI、EMA20/50/200多周期结构、MACD、RSI背离 做多因子打分。
+    这是关注币种实时分析和历史回测共用的核心打分逻辑，保证"现在看到的提示"和
+    "回测验证的规则"是同一套代码，不会两边逻辑不一致"""
     if len(prices) < 15:
         return None
 
@@ -389,12 +446,19 @@ def compute_signal(prices, extra_rules=True):
     change_7d = (prices[-1] - prices[-8]) / prices[-8] * 100 if len(prices) >= 8 else None
 
     rsi = compute_rsi(prices, period=14)
-    ma7 = compute_ma(prices, 7)
-    ma25 = compute_ma(prices, 25) if len(prices) >= 25 else None
+    ema20_series = compute_ema_series(prices, 20)
+    ema50_series = compute_ema_series(prices, 50)
+    ema200_series = compute_ema_series(prices, 200)
+    ema20 = ema20_series[-1] if ema20_series else None
+    ema50 = ema50_series[-1] if ema50_series else None
+    ema200 = ema200_series[-1] if ema200_series else None
+    macd = compute_macd(prices)
+    divergence = detect_divergence(prices)
 
     score = 0
     reasons = []
 
+    # RSI 水平
     if rsi is not None:
         if rsi < 30:
             score += 2
@@ -405,15 +469,48 @@ def compute_signal(prices, extra_rules=True):
         else:
             reasons.append(f"RSI(14)={rsi:.0f}，中性")
 
-    if ma7 is not None and ma25 is not None:
-        if current_price > ma7 > ma25:
-            score += 1
-            reasons.append("现价>MA7>MA25，多头排列")
-        elif current_price < ma7 < ma25:
-            score -= 1
-            reasons.append("现价<MA7<MA25，空头排列")
+    # EMA20/50/200 多周期结构
+    if ema20 is not None and ema50 is not None:
+        if ema200 is not None:
+            if current_price < ema200 and current_price > ema20 and ema20 > ema50:
+                score += 2
+                reasons.append("现价<EMA200但现价>EMA20>EMA50，熊市末期恢复迹象")
+            elif current_price > ema200 and current_price > ema20 > ema50:
+                score += 1
+                reasons.append("现价>EMA20>EMA50>EMA200，多头排列")
+            elif current_price < ema50 and ema20 < ema50:
+                score -= 2
+                reasons.append("现价<EMA50且EMA20<EMA50，趋势转弱")
+            else:
+                reasons.append("EMA尚未形成明显多头或空头排列")
         else:
-            reasons.append("均线尚未形成明显排列")
+            if current_price > ema20 > ema50:
+                score += 1
+                reasons.append("现价>EMA20>EMA50，短中期偏多")
+            elif current_price < ema20 < ema50:
+                score -= 1
+                reasons.append("现价<EMA20<EMA50，短中期偏空")
+
+    # MACD 柱状图转折
+    if macd is not None:
+        if macd["prev_hist"] <= 0 < macd["hist"]:
+            score += 1
+            reasons.append("MACD柱状图由负转正，动能转强")
+        elif macd["prev_hist"] >= 0 > macd["hist"]:
+            score -= 1
+            reasons.append("MACD柱状图由正转负，动能转弱")
+        elif macd["hist"] > 0 and macd["hist"] < macd["prev_hist"]:
+            reasons.append("MACD柱状图仍为正但在缩小，上涨动能减弱")
+        elif macd["hist"] < 0 and macd["hist"] > macd["prev_hist"]:
+            reasons.append("MACD柱状图仍为负但在收窄，下跌动能减弱")
+
+    # RSI 背离
+    if divergence == "bullish":
+        score += 2
+        reasons.append("价格创近期新低但RSI未跟随创新低，底背离信号")
+    elif divergence == "bearish":
+        score -= 2
+        reasons.append("价格创近期新高但RSI未跟随创新高，顶背离信号")
 
     if extra_rules:
         if change_24h >= 15:
@@ -423,46 +520,151 @@ def compute_signal(prices, extra_rules=True):
             score += 1
             reasons.append(f"7d跌{change_7d:+.0f}%且RSI偏低，或超跌企稳")
 
-    if score >= 3:
+    if score >= 5:
         label, level = "🟢 关注买入区", "buy"
-    elif score >= 1:
+    elif score >= 2:
         label, level = "🟡 偏多可关注", "watch_buy"
-    elif score <= -3:
+    elif score <= -5:
         label, level = "🔴 关注卖出/止盈", "sell"
-    elif score <= -1:
+    elif score <= -2:
         label, level = "🟠 偏空注意风险", "watch_sell"
     else:
         label, level = "⚪ 中性观望", "neutral"
 
     return {
         "price": current_price, "change_24h": change_24h, "change_7d": change_7d,
-        "rsi": rsi, "ma7": ma7, "ma25": ma25, "score": score, "label": label, "level": level,
-        "reasons": reasons,
+        "rsi": rsi, "ema20": ema20, "ema50": ema50, "ema200": ema200,
+        "macd_hist": macd["hist"] if macd else None, "divergence": divergence,
+        "score": score, "label": label, "level": level, "reasons": reasons,
     }
 
 
-def analyze_coin(raw_query, cg_api_key=None):
-    """综合价格、24h/7d涨跌、RSI、均线，给出一个状态提示 + 理由列表
+# ========== 衍生品层：资金费率 + 未平仓合约 ==========
+# 数据源 Binance 合约公开API，完全免费不需要key。这两个指标是加密货币独有的、
+# 反映短期杠杆情绪是否过热的硬指标，参考了你贴的那份多因子系统文档里排第3、4优先级的建议
+
+def guess_exchange_ticker(coin_id, raw_query):
+    """从币种id或者你输入的原始文本猜一个交易所常用的代号（比如 bitcoin -> BTC）
+    猜不出来就返回None，猜错了也没关系，后面请求会直接返回空结果，不会报错"""
+    rev = {v: k for k, v in COMMON_TICKER_MAP.items()}
+    if coin_id in rev:
+        return rev[coin_id].upper()
+    q = raw_query.strip().upper()
+    if q.isalpha() and 2 <= len(q) <= 6:
+        return q
+    return None
+
+
+def fetch_funding_rate(ticker):
+    """永续合约资金费率，正值代表多头付钱给空头（多头拥挤），负值反过来"""
+    symbol = ticker.upper() + "USDT"
+    try:
+        resp = requests.get(f"{BINANCE_FAPI}/premiumIndex", params={"symbol": symbol}, timeout=10)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if "lastFundingRate" not in data:
+            return None
+        return {
+            "symbol": symbol, "funding_rate_pct": float(data["lastFundingRate"]) * 100,
+            "mark_price": float(data.get("markPrice", 0)),
+        }
+    except Exception:
+        return None
+
+
+def fetch_open_interest_trend(ticker, days=7):
+    """未平仓合约总价值(USD)近几天的变化趋势"""
+    symbol = ticker.upper() + "USDT"
+    try:
+        resp = requests.get(f"{BINANCE_FUTURES_DATA}/openInterestHist",
+                             params={"symbol": symbol, "period": "1d", "limit": days}, timeout=10)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if not data:
+            return None
+        values = [float(d["sumOpenInterestValue"]) for d in data]
+        change_pct = (values[-1] - values[0]) / values[0] * 100 if values[0] else 0
+        return {"symbol": symbol, "current": values[-1], "change_pct": change_pct, "days": len(values)}
+    except Exception:
+        return None
+
+
+def analyze_derivatives(ticker, change_24h=None):
+    """把资金费率和未平仓合约变化拼成一份"杠杆情绪"参考，只覆盖 Binance 合约有上架的币种
+    （主要是主流币和有一定交易量的山寨币，很多小市值新币没有合约，会返回None）"""
+    funding = fetch_funding_rate(ticker)
+    oi = fetch_open_interest_trend(ticker)
+    if funding is None and oi is None:
+        return None
+
+    reasons = []
+    bias = "neutral"
+
+    if funding is not None:
+        fr = funding["funding_rate_pct"]
+        if fr >= 0.05:
+            reasons.append(f"资金费率 {fr:+.3f}%，多头拥挤、杠杆偏热，警惕挤仓回调")
+            bias = "risk"
+        elif fr <= -0.02:
+            reasons.append(f"资金费率 {fr:+.3f}%，空头拥挤，存在挤空反弹的可能")
+            bias = "risk"
+        else:
+            reasons.append(f"资金费率 {fr:+.3f}%，杠杆情绪相对健康")
+
+    if oi is not None:
+        oi_chg = oi["change_pct"]
+        if abs(oi_chg) >= 15:
+            direction = "上升" if oi_chg > 0 else "下降"
+            reasons.append(f"未平仓合约近{oi['days']}天{direction}{abs(oi_chg):.1f}%，杠杆仓位变化明显")
+        else:
+            reasons.append(f"未平仓合约近{oi['days']}天变化{oi_chg:+.1f}%，杠杆仓位相对稳定")
+
+    if funding is not None and oi is not None and change_24h is not None:
+        fr, oi_chg = funding["funding_rate_pct"], oi["change_pct"]
+        if change_24h > 5 and oi_chg > 10 and fr > 0.03:
+            reasons.append("⚠️ 价格涨+持仓涨+费率涨三连击，历史上常是杠杆过热的最后一波，见顶风险上升")
+            bias = "overheat"
+        elif change_24h < -5 and oi_chg < -10 and fr < 0.01:
+            reasons.append("💡 价格跌+持仓降+费率回落，可能是杠杆出清后的机会窗口，不一定是趋势破坏")
+            bias = "washout"
+
+    return {"funding": funding, "open_interest": oi, "bias": bias, "reasons": reasons}
+
+
+def analyze_coin(raw_query, cg_api_key=None, include_derivatives=True):
+    """综合价格、24h/7d涨跌、RSI、EMA、MACD、背离，给出一个状态提示 + 理由列表
     这是基于常见技术指标的规则打分，不是预测，仅作为你自己判断时的参考"""
     coin_id, err = resolve_coin_id(raw_query, cg_api_key)
     if not coin_id:
         return {"coin": raw_query, "error": err}
 
-    prices_daily = fetch_market_chart(coin_id, days=90, cg_api_key=cg_api_key)
+    prices_daily = fetch_market_chart(coin_id, days=365, cg_api_key=cg_api_key)
     sig = compute_signal(prices_daily)
     if sig is None:
         return {"coin": coin_id, "error": "历史数据不足，暂时无法分析"}
 
     sig["coin"] = coin_id
     sig["query"] = raw_query
+
+    sig["derivatives"] = None
+    if include_derivatives:
+        ticker = guess_exchange_ticker(coin_id, raw_query)
+        if ticker:
+            try:
+                sig["derivatives"] = analyze_derivatives(ticker, sig.get("change_24h"))
+            except Exception:
+                sig["derivatives"] = None
+
     return sig
 
 
-def analyze_watchlist(coin_ids, include_whale=False, cg_api_key=None):
+def analyze_watchlist(coin_ids, include_whale=False, cg_api_key=None, include_derivatives=True):
     results = []
     for coin_id in coin_ids:
         try:
-            r = analyze_coin(coin_id, cg_api_key)
+            r = analyze_coin(coin_id, cg_api_key, include_derivatives=include_derivatives)
             if include_whale and "error" not in r:
                 r["whale"] = get_watchlist_whale_info(r["coin"], cg_api_key)
         except Exception as e:
@@ -493,7 +695,7 @@ def analyze_forex_pair(pair):
     （extra_rules=False，因为"24h暴涨追高"这类规则是为加密货币的高波动设计的，
     外汇日内波动通常远小于1%，套用同样阈值基本不会触发，意义不大）"""
     try:
-        prices = fetch_forex_history(pair, days=100)
+        prices = fetch_forex_history(pair, days=300)
     except Exception as e:
         return {"coin": pair, "error": f"格式需要是 '美元/日元' 这种写法，如 USD/JPY（{e}）"}
 
@@ -522,7 +724,7 @@ def backtest_signal(prices, forward_days=7, extra_rules=True):
     """把 compute_signal 应用到历史每一天，跟"forward_days天后"的真实涨跌做比对
     返回按信号等级(buy/watch_buy/neutral/watch_sell/sell)分组的胜率统计
     这是真实历史数据回放出来的结果，不是编的数字"""
-    min_window = 25  # 至少要能算出MA25才开始回放
+    min_window = 40  # 至少要能算出MACD(26+9)才开始回放，前面数据不够的天数直接跳过
     if len(prices) < min_window + forward_days + 1:
         return None
 
@@ -643,6 +845,15 @@ def generate_daily_report(watchlist_results, forex_results, new_coin_candidates,
         top = new_coin_candidates[:3]
         names = "、".join(f"{c['symbol']}({c['chain']}, 评分{c['score']:.0f})" for c in top)
         lines.append(f"\n**新币扫描Top{len(top)}**：{names}")
+
+    overheat = [r for r in (watchlist_results or []) if not r.get("error") and (r.get("derivatives") or {}).get("bias") == "overheat"]
+    washout = [r for r in (watchlist_results or []) if not r.get("error") and (r.get("derivatives") or {}).get("bias") == "washout"]
+    if overheat:
+        names = "、".join(r["coin"].upper() for r in overheat)
+        lines.append(f"\n**⚠️ 杠杆过热提醒**：{names} 出现价格+持仓+费率三连击，见顶风险上升")
+    if washout:
+        names = "、".join(r["coin"].upper() for r in washout)
+        lines.append(f"\n**💡 杠杆出清提醒**：{names} 价格跌+持仓降+费率回落，可能是机会窗口")
 
     lines.append(
         "\n\n⚠️ 以上内容由规则自动拼接生成，只是把当前已获取的数据结构化摘要，"
