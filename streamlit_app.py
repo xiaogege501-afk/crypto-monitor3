@@ -4,6 +4,7 @@
 云端部署：见 DEPLOY_GUIDE.md
 """
 import streamlit as st
+import datetime
 import core
 
 st.set_page_config(page_title="投资监控看板", page_icon="📊", layout="wide")
@@ -47,6 +48,53 @@ def render_watchlist_row(r, show_whale=False):
         st.caption(f"{bias_icon} 杠杆情绪：{'　'.join(deriv['reasons'])}")
 
     st.divider()
+
+
+def render_resonance_panel(mtf_data, is_crypto=True):
+    resonance = mtf_data["resonance"]
+    strength = resonance["strength"]
+
+    # 用Streamlit自带的彩色提示框做强弱区分：共振信号越强、颜色越醒目，避免你漏看重要结论
+    if strength == "strong_bull":
+        st.success(f"#### {resonance['desc']}")
+    elif strength == "strong_bear":
+        st.error(f"#### {resonance['desc']}")
+    elif strength in ("lean_bull", "lean_bear"):
+        st.warning(resonance["desc"])
+    else:
+        st.info(resonance["desc"])
+
+    tf_items = list(mtf_data["timeframes"].items())
+    cols = st.columns(len(tf_items))
+    for col, (key, tf) in zip(cols, tf_items):
+        with col:
+            if tf:
+                color = LEVEL_COLOR.get(tf["level"], "gray")
+                st.markdown(f"**{tf['cn_label']}**")
+                st.markdown(f":{color}[{tf['label']}]")
+            else:
+                st.markdown(f"**{key}**")
+                st.caption("数据不足")
+
+    if is_crypto and mtf_data.get("entry") is not None:
+        entry = mtf_data["entry"]
+        if entry["triggered"]:
+            st.success(f"🎯 **{entry['action']}**")
+            for reason in entry["reasons"]:
+                st.write(f"• {reason}")
+        else:
+            st.caption("15分钟周期暂未出现明确的顺势信号，建议继续观察，不要单独用15分钟逆势判断")
+
+        if mtf_data.get("close_time_15m_ms"):
+            close_dt = datetime.datetime.fromtimestamp(mtf_data["close_time_15m_ms"] / 1000, tz=datetime.timezone.utc)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            mins_ago = int((now - close_dt).total_seconds() / 60)
+            if mins_ago > 15:
+                st.warning(f"⏱️ 这个15分钟信号截至 {mins_ago} 分钟前，已经过了一根K线的时间，建议重新点一次分析")
+            else:
+                st.caption(f"⏱️ 15分钟信号截至 {mins_ago} 分钟前")
+
+    st.caption("⚠️ 多周期共振是「多个独立视角是否一致」的参考框架，不是预测；15分钟信号只在大周期方向上找顺势进场时机，不建议单独逆势使用")
 
 
 # ---------- 顶部：市场概览 ----------
@@ -176,7 +224,7 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
 
 # ---------- Tab 1: 加密货币关注 ----------
 with tab1:
-    st.caption("基于 RSI、EMA20/50/200多周期结构、MACD、RSI背离 做多因子技术面打分，加上Binance合约的杠杆情绪，仅供参考，不构成投资建议")
+    st.caption("基于 RSI、EMA20/60/120多周期结构、SMA20动能、MACD、RSI背离 做多因子技术面打分，加上Binance合约的杠杆情绪，仅供参考，不构成投资建议")
 
     if st.button("🔄 刷新分析", key="refresh_watchlist"):
         st.cache_data.clear()
@@ -194,6 +242,25 @@ with tab1:
             watchlist_results = get_watchlist_analysis(tuple(watchlist), show_whale_watchlist, cg_key, show_derivatives)
         for r in watchlist_results:
             render_watchlist_row(r, show_whale=show_whale_watchlist)
+
+    st.divider()
+    st.subheader("🔎 多周期共振分析（15分钟/1小时/日线/周线）")
+    st.caption(
+        "数据源Binance现货K线，免费；只针对你输入的单个币种做深度分析，不会对整个关注列表批量跑（避免请求过多）。"
+        "大周期(周线)定方向、小周期(15分钟)找顺势进场时机"
+    )
+    mc1, mc2 = st.columns([3, 1])
+    mtf_ticker = mc1.text_input("要分析的币种代号", value="BTC", key="mtf_crypto_ticker")
+    if mc2.button("开始分析", key="mtf_crypto_btn", type="primary"):
+        with st.spinner("正在拉取周线/日线/小时线/15分钟线数据..."):
+            st.session_state["mtf_crypto_result"] = core.analyze_crypto_multi_timeframe(mtf_ticker)
+
+    if "mtf_crypto_result" in st.session_state:
+        mtf_result = st.session_state["mtf_crypto_result"]
+        if mtf_result:
+            render_resonance_panel(mtf_result, is_crypto=True)
+        else:
+            st.warning("没有拉到这个币种的K线数据，可能是Binance没有对应的USDT交易对，换个主流一点的代号试试")
 
 
 # ---------- Tab 2: 外汇关注 ----------
@@ -217,6 +284,25 @@ with tab2:
             forex_results = get_forex_analysis(tuple(forex_watchlist))
         for r in forex_results:
             render_watchlist_row(r, show_whale=False)
+
+    st.divider()
+    st.subheader("🔎 多周期共振分析（日/周/月）")
+    st.caption(
+        "外汇没有免费的分钟级数据，周线和月线是从日线数据自己聚合出来的，不需要额外调用接口。"
+        "大周期(月线)定方向、小周期(日线)辅助判断"
+    )
+    fc1, fc2 = st.columns([3, 1])
+    mtf_pair = fc1.text_input("要分析的货币对", value="USD/JPY", key="mtf_forex_pair")
+    if fc2.button("开始分析", key="mtf_forex_btn", type="primary"):
+        with st.spinner("正在获取并聚合日/周/月数据..."):
+            st.session_state["mtf_forex_result"] = core.analyze_forex_multi_timeframe(mtf_pair)
+
+    if "mtf_forex_result" in st.session_state:
+        mtf_forex_result = st.session_state["mtf_forex_result"]
+        if mtf_forex_result:
+            render_resonance_panel(mtf_forex_result, is_crypto=False)
+        else:
+            st.warning("没有拉到这个货币对的数据，检查一下格式是不是 美元/日元 这种写法，比如 USD/JPY")
 
 
 # ---------- Tab 3: 挖掘机会（新币早期 / 二级市场强势 / 一级市场融资） ----------

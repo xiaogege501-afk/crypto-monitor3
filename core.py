@@ -435,9 +435,12 @@ def get_watchlist_whale_info(coin_id, cg_api_key=None):
 
 def compute_signal(prices, extra_rules=True):
     """给定一段按时间正序排列的价格序列（最后一个视为"当前"价格），
-    综合 RSI、EMA20/50/200多周期结构、MACD、RSI背离 做多因子打分。
+    综合 RSI、EMA20/60/120多周期结构、SMA20动能、MACD、RSI背离 做多因子打分。
     这是关注币种实时分析和历史回测共用的核心打分逻辑，保证"现在看到的提示"和
-    "回测验证的规则"是同一套代码，不会两边逻辑不一致"""
+    "回测验证的规则"是同一套代码，不会两边逻辑不一致
+    EMA参数用20/60/120（对应约1个月/3个月/6个月），而不是常见的20/50/200，
+    是因为这套系统要在多个不同周期（15分钟/1小时/日线/周线）上统一复用同一套逻辑，
+    20/60/120整数倍关系更整齐，各周期含义一致"""
     if len(prices) < 15:
         return None
 
@@ -447,11 +450,12 @@ def compute_signal(prices, extra_rules=True):
 
     rsi = compute_rsi(prices, period=14)
     ema20_series = compute_ema_series(prices, 20)
-    ema50_series = compute_ema_series(prices, 50)
-    ema200_series = compute_ema_series(prices, 200)
+    ema60_series = compute_ema_series(prices, 60)
+    ema120_series = compute_ema_series(prices, 120)
     ema20 = ema20_series[-1] if ema20_series else None
-    ema50 = ema50_series[-1] if ema50_series else None
-    ema200 = ema200_series[-1] if ema200_series else None
+    ema60 = ema60_series[-1] if ema60_series else None
+    ema120 = ema120_series[-1] if ema120_series else None
+    sma20 = compute_ma(prices, 20)
     macd = compute_macd(prices)
     divergence = detect_divergence(prices)
 
@@ -469,27 +473,38 @@ def compute_signal(prices, extra_rules=True):
         else:
             reasons.append(f"RSI(14)={rsi:.0f}，中性")
 
-    # EMA20/50/200 多周期结构
-    if ema20 is not None and ema50 is not None:
-        if ema200 is not None:
-            if current_price < ema200 and current_price > ema20 and ema20 > ema50:
+    # EMA20/60/120 多周期结构
+    if ema20 is not None and ema60 is not None:
+        if ema120 is not None:
+            if current_price < ema120 and current_price > ema20 and ema20 > ema60:
                 score += 2
-                reasons.append("现价<EMA200但现价>EMA20>EMA50，熊市末期恢复迹象")
-            elif current_price > ema200 and current_price > ema20 > ema50:
+                reasons.append("现价<EMA120但现价>EMA20>EMA60，趋势末期恢复迹象")
+            elif current_price > ema120 and current_price > ema20 > ema60:
                 score += 1
-                reasons.append("现价>EMA20>EMA50>EMA200，多头排列")
-            elif current_price < ema50 and ema20 < ema50:
+                reasons.append("现价>EMA20>EMA60>EMA120，多头排列")
+            elif current_price < ema60 and ema20 < ema60:
                 score -= 2
-                reasons.append("现价<EMA50且EMA20<EMA50，趋势转弱")
+                reasons.append("现价<EMA60且EMA20<EMA60，趋势转弱")
             else:
                 reasons.append("EMA尚未形成明显多头或空头排列")
         else:
-            if current_price > ema20 > ema50:
+            if current_price > ema20 > ema60:
                 score += 1
-                reasons.append("现价>EMA20>EMA50，短中期偏多")
-            elif current_price < ema20 < ema50:
+                reasons.append("现价>EMA20>EMA60，短中期偏多")
+            elif current_price < ema20 < ema60:
                 score -= 1
-                reasons.append("现价<EMA20<EMA50，短中期偏空")
+                reasons.append("现价<EMA20<EMA60，短中期偏空")
+
+    # SMA20 vs EMA20：判断近期动能是在加速还是减速
+    # EMA对近期价格更敏感，EMA20明显高于SMA20说明最近涨得比前段时间更猛（加速）
+    if ema20 is not None and sma20 is not None and sma20 != 0:
+        gap_pct = (ema20 - sma20) / sma20 * 100
+        if gap_pct > 0.3:
+            score += 1
+            reasons.append(f"EMA20高于SMA20 {gap_pct:.1f}%，近期上涨动能在加速")
+        elif gap_pct < -0.3:
+            score -= 1
+            reasons.append(f"EMA20低于SMA20 {abs(gap_pct):.1f}%，近期下跌动能在加速")
 
     # MACD 柱状图转折
     if macd is not None:
@@ -533,7 +548,7 @@ def compute_signal(prices, extra_rules=True):
 
     return {
         "price": current_price, "change_24h": change_24h, "change_7d": change_7d,
-        "rsi": rsi, "ema20": ema20, "ema50": ema50, "ema200": ema200,
+        "rsi": rsi, "ema20": ema20, "ema60": ema60, "ema120": ema120, "sma20": sma20,
         "macd_hist": macd["hist"] if macd else None, "divergence": divergence,
         "score": score, "label": label, "level": level, "reasons": reasons,
     }
@@ -631,6 +646,174 @@ def analyze_derivatives(ticker, change_24h=None):
             bias = "washout"
 
     return {"funding": funding, "open_interest": oi, "bias": bias, "reasons": reasons}
+
+
+# ========== 多周期共振：15分钟/1小时/日线/周线（加密），日/周/月（外汇）==========
+# 核心思路：大周期定方向、小周期找时机。每个周期各自跑一遍compute_signal，
+# 结果一致="共振"，可信度更高；结果打架="市场方向不明朗"，倾向观望
+# 加密货币用 Binance 现货K线（免费，不需要key，能精确指定任意周期）
+
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+
+
+def fetch_binance_klines(ticker, interval, limit=300):
+    """interval: 15m / 1h / 1d / 1w 等Binance支持的周期写法"""
+    symbol = ticker.upper() + "USDT"
+    try:
+        resp = requests.get(BINANCE_KLINES_URL, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=15)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if not data or isinstance(data, dict):  # 出错时Binance会返回一个带code字段的dict而不是列表
+            return None
+        closes = [float(k[4]) for k in data]
+        return {"closes": closes, "last_close_time_ms": data[-1][6]}
+    except Exception:
+        return None
+
+
+def resample_to_periods(daily_prices, period_days):
+    """把日线序列往回每隔period_days天取一个点，粗略聚合成周线/月线
+    （用来在没有分钟级外汇数据的情况下，从日线自己拼出周期结构，不用额外调接口）"""
+    if period_days <= 1 or len(daily_prices) < period_days:
+        return daily_prices
+    reversed_prices = daily_prices[::-1]
+    sampled = reversed_prices[::period_days]
+    return sampled[::-1]
+
+
+def compute_resonance(timeframe_results):
+    """timeframe_results: {label: {"level":..., "weight":...} 或 None}
+    综合多个周期的方向，判断是"共振"还是"打架" """
+    def direction(level):
+        if level in ("buy", "watch_buy"):
+            return 1
+        if level in ("sell", "watch_sell"):
+            return -1
+        return 0
+
+    valid = {k: v for k, v in timeframe_results.items() if v}
+    if not valid:
+        return None
+
+    dirs = [direction(v["level"]) for v in valid.values()]
+    weighted_sum = sum(d * v["weight"] for d, v in zip(dirs, valid.values()))
+    total_weight = sum(v["weight"] for v in valid.values())
+    n = len(dirs)
+
+    if all(d > 0 for d in dirs) and n >= 3:
+        strength, desc = "strong_bull", f"{'🟢' * n} {n}个周期共振向上，信号强度高"
+    elif all(d < 0 for d in dirs) and n >= 3:
+        strength, desc = "strong_bear", f"{'🔴' * n} {n}个周期共振向下，信号强度高"
+    elif total_weight and weighted_sum > total_weight * 0.4:
+        strength, desc = "lean_bull", "🟡 多数周期偏多，但未完全共振，注意背离"
+    elif total_weight and weighted_sum < -total_weight * 0.4:
+        strength, desc = "lean_bear", "🟠 多数周期偏空，但未完全共振，注意背离"
+    else:
+        strength, desc = "mixed", "⚪ 各周期方向不一致，市场方向不明朗，建议观望"
+
+    return {"strength": strength, "desc": desc, "weighted_sum": weighted_sum, "total_weight": total_weight}
+
+
+def analyze_crypto_multi_timeframe(ticker):
+    """周线(权重4,大趋势) / 日线(权重2,中期) / 1小时(权重1) / 15分钟(权重1,进场时机)"""
+    tf_config = [("1w", "1w", 4, "周线·大趋势"), ("1d", "1d", 2, "日线·中期"),
+                 ("1h", "1h", 1, "小时线·短期"), ("15m", "15m", 1, "15分钟·进场时机")]
+
+    results = {}
+    close_time_15m = None
+    for key, interval, weight, cn_label in tf_config:
+        kl = fetch_binance_klines(ticker, interval, limit=300)
+        if not kl or len(kl["closes"]) < 15:
+            results[key] = None
+            continue
+        sig = compute_signal(kl["closes"], extra_rules=(interval in ("1d", "1w")))
+        if sig is None:
+            results[key] = None
+            continue
+        results[key] = {"level": sig["level"], "label": sig["label"], "score": sig["score"],
+                         "weight": weight, "cn_label": cn_label}
+        if key == "15m":
+            close_time_15m = kl["last_close_time_ms"]
+
+    if not any(results.values()):
+        return None
+
+    resonance = compute_resonance(results)
+    macro_level = (results.get("1w") or results.get("1d") or {}).get("level", "neutral") if (results.get("1w") or results.get("1d")) else "neutral"
+    macro_bias = "bullish" if macro_level in ("buy", "watch_buy") else ("bearish" if macro_level in ("sell", "watch_sell") else "neutral")
+
+    entry = find_entry_signal_15m(ticker, macro_bias) if macro_bias != "neutral" else None
+
+    return {
+        "timeframes": results, "resonance": resonance, "macro_bias": macro_bias,
+        "entry": entry, "close_time_15m_ms": close_time_15m,
+    }
+
+
+def find_entry_signal_15m(ticker, macro_bias):
+    """在15分钟周期上找"顺大势"的精准进场点，只在macro_bias方向上找，不逆势用15分钟单独判断"""
+    kl = fetch_binance_klines(ticker, "15m", limit=200)
+    if not kl or len(kl["closes"]) < 130:
+        return None
+    prices = kl["closes"]
+
+    rsi_now = compute_rsi(prices, 14)
+    rsi_prev = compute_rsi(prices[:-1], 14)
+    ema20_series = compute_ema_series(prices, 20)
+    ema20 = ema20_series[-1] if ema20_series else None
+    macd = compute_macd(prices)
+    current = prices[-1]
+
+    reasons = []
+    if macro_bias == "bullish":
+        if ema20 and abs(current - ema20) / ema20 < 0.006 and prices[-1] >= prices[-2]:
+            reasons.append("15分钟价格回踩EMA20附近后重新收高，顺大势逢低企稳")
+        if rsi_now is not None and rsi_prev is not None and rsi_now < 40 and rsi_now > rsi_prev:
+            reasons.append(f"15分钟RSI从{rsi_prev:.0f}回升至{rsi_now:.0f}，短期超卖修复")
+        if macd and macd["prev_hist"] <= 0 < macd["hist"]:
+            reasons.append("15分钟MACD柱状图由负转正，短期动能转强")
+        action = "顺势逢低进场参考" if reasons else None
+    else:  # bearish
+        if ema20 and abs(current - ema20) / ema20 < 0.006 and prices[-1] <= prices[-2]:
+            reasons.append("15分钟价格反弹至EMA20附近后重新回落，顺大势逢高承压")
+        if rsi_now is not None and rsi_prev is not None and rsi_now > 60 and rsi_now < rsi_prev:
+            reasons.append(f"15分钟RSI从{rsi_prev:.0f}回落至{rsi_now:.0f}，短期超买修复")
+        if macd and macd["prev_hist"] >= 0 > macd["hist"]:
+            reasons.append("15分钟MACD柱状图由正转负，短期动能转弱")
+        action = "顺势减仓/止盈参考" if reasons else None
+
+    return {
+        "triggered": bool(reasons), "reasons": reasons, "action": action, "price": current,
+        "as_of_ms": kl["last_close_time_ms"],
+    }
+
+
+def analyze_forex_multi_timeframe(pair):
+    """月线(权重4,大趋势) / 周线(权重2,中期) / 日线(权重1,短期)
+    没有免费的外汇分钟级数据，周线月线是从日线数据自己聚合出来的，不需要额外请求接口"""
+    try:
+        daily = fetch_forex_history(pair, days=800)
+    except Exception:
+        return None
+    if len(daily) < 60:
+        return None
+
+    weekly = resample_to_periods(daily, 5)
+    monthly = resample_to_periods(daily, 21)
+
+    tf_config = [("1mo", monthly, 4, "月线·大趋势"), ("1w", weekly, 2, "周线·中期"), ("1d", daily, 1, "日线·短期")]
+    results = {}
+    for key, series, weight, cn_label in tf_config:
+        sig = compute_signal(series, extra_rules=False) if len(series) >= 15 else None
+        results[key] = {"level": sig["level"], "label": sig["label"], "score": sig["score"],
+                         "weight": weight, "cn_label": cn_label} if sig else None
+
+    if not any(results.values()):
+        return None
+
+    resonance = compute_resonance(results)
+    return {"timeframes": results, "resonance": resonance}
 
 
 def analyze_coin(raw_query, cg_api_key=None, include_derivatives=True):
