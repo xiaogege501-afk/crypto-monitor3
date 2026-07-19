@@ -862,6 +862,126 @@ def generate_daily_report(watchlist_results, forex_results, new_coin_candidates,
     return "\n".join(lines)
 
 
+# ========== 二级市场：当前强势、有叙事有背景的主流/中大市值项目 ==========
+# 数据源 CoinGecko trending 接口（免费），这是CoinGecko根据全网搜索量实时算出来的
+# "现在大家都在搜什么币"，跟新币扫描（DexScreener挖的是刚起步的微盘新币）是互补的两层：
+# 这里覆盖的是已经有一定市值、正在被广泛关注、有明确叙事和项目背景的币种
+
+COINGECKO_TRENDING_URL = "https://api.coingecko.com/api/v3/search/trending"
+
+
+def fetch_trending_coins(cg_api_key=None):
+    resp = requests.get(COINGECKO_TRENDING_URL, params=cg_params({}, cg_api_key), timeout=15)
+    resp.raise_for_status()
+    return [c["item"] for c in resp.json().get("coins", [])]
+
+
+def fetch_coin_detail_summary(coin_id, cg_api_key=None):
+    """拿项目简介、赛道分类(叙事)、市值排名等背景信息"""
+    url = COINGECKO_COIN_URL.format(id=coin_id)
+    params = cg_params({"localization": "false", "tickers": "false", "market_data": "true",
+                         "community_data": "false", "developer_data": "false", "sparkline": "false"}, cg_api_key)
+    resp = requests.get(url, params=params, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+
+    desc_raw = (data.get("description") or {}).get("en", "") or ""
+    desc = desc_raw.split(". ")[0].strip()
+    if desc and not desc.endswith("."):
+        desc += "."
+    desc = desc or "暂无项目方提供的英文简介"
+
+    categories = [c for c in (data.get("categories") or []) if c]
+    market = data.get("market_data") or {}
+
+    return {
+        "coin": coin_id, "name": data.get("name"), "symbol": (data.get("symbol") or "").upper(),
+        "categories": categories, "description": desc,
+        "price": (market.get("current_price") or {}).get("usd"),
+        "change_24h": market.get("price_change_percentage_24h"),
+        "change_7d": market.get("price_change_percentage_7d"),
+        "market_cap": (market.get("market_cap") or {}).get("usd"),
+        "market_cap_rank": data.get("market_cap_rank"),
+    }
+
+
+def scan_trending_secondary(cg_api_key=None, limit=7):
+    """CoinGecko trending Top N，逐个拉背景信息拼成"二级市场强势+有叙事"的列表"""
+    try:
+        trending = fetch_trending_coins(cg_api_key)
+    except Exception as e:
+        return None, f"trending接口暂时不可用({e})，建议稍后重试"
+
+    results = []
+    for item in trending[:limit]:
+        coin_id = item.get("id")
+        if not coin_id:
+            continue
+        try:
+            detail = fetch_coin_detail_summary(coin_id, cg_api_key)
+        except Exception:
+            continue
+        detail["search_rank"] = item.get("score", 0) + 1  # CoinGecko原始score从0开始，+1显示更直观
+        results.append(detail)
+        time.sleep(0.3)
+
+    if not results:
+        return None, "暂时没拉到trending数据，建议稍后重试"
+    return results, None
+
+
+# ========== 一级市场：近期融资动态 ==========
+# 数据源 DefiLlama 的公开融资数据（defillama.com/raises 页面背后的接口）。
+# 老实说明：这个接口不在DefiLlama官方文档列出的正式API目录里，是页面本身在用的接口，
+# 理论上公开可访问，但字段结构没有官方保证，如果哪天返回异常，会提示你去网页手动查看
+
+DEFILLAMA_RAISES_URL = "https://api.llama.fi/raises"
+
+# 一二线加密VC机构名单（不完整，只覆盖最常见的几家），命中会标注"知名机构参投"
+TIER1_INVESTORS = {
+    "a16z", "a16z crypto", "andreessen horowitz", "paradigm", "binance labs", "ybb capital",
+    "coinbase ventures", "pantera capital", "sequoia capital", "multicoin capital",
+    "polychain capital", "dragonfly", "dragonfly capital", "jump crypto", "framework ventures",
+    "1kx", "variant fund", "electric capital", "hashkey capital", "okx ventures",
+}
+
+
+def fetch_primary_market_raises(days=30, top_n=15):
+    """近N天的融资事件，优先展示有知名机构参投的、金额较大的"""
+    try:
+        resp = requests.get(DEFILLAMA_RAISES_URL, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        return None, f"一级市场融资数据源暂时不可用（{e}），建议直接去 https://defillama.com/raises 手动查看"
+
+    raises = data.get("raises") if isinstance(data, dict) else data
+    if not raises:
+        return None, "暂时没有拉到融资数据，建议直接去 https://defillama.com/raises 手动查看"
+
+    cutoff = time.time() - days * 86400
+    results = []
+    for r in raises:
+        ts = r.get("date")
+        if not ts or ts < cutoff:
+            continue
+        leads = [x for x in (r.get("leadInvestors") or []) if x]
+        others = [x for x in (r.get("otherInvestors") or []) if x]
+        tier1_hit = [x for x in (leads + others) if x.lower() in TIER1_INVESTORS]
+        results.append({
+            "name": r.get("name"), "date": datetime.date.fromtimestamp(ts).isoformat(),
+            "amount": r.get("amount"), "round": r.get("round"), "category": r.get("category"),
+            "chains": r.get("chains") or [], "lead_investors": leads, "other_investors": others,
+            "tier1_hit": tier1_hit, "source": r.get("source"), "valuation": r.get("valuation"),
+        })
+
+    if not results:
+        return None, f"最近{days}天没有查到新的融资记录，可以去 https://defillama.com/raises 看更早的历史"
+
+    results.sort(key=lambda x: (len(x["tier1_hit"]) > 0, x["amount"] or 0), reverse=True)
+    return results[:top_n], None
+
+
 # ========== 新币动量扫描 ==========
 
 def get_new_token_profiles(chains):

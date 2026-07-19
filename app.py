@@ -171,7 +171,7 @@ with st.sidebar:
     st.caption("⚠️ 保存在服务器本地文件里；如果你重新推送代码触发平台重新构建，需要重新保存一次")
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["👀 加密货币关注", "💱 外汇关注", "🚀 新币动量扫描", "🐋 巨鲸监控", "📈 信号回测", "📰 每日报告"]
+    ["👀 加密货币关注", "💱 外汇关注", "🚀 挖掘机会", "🐋 巨鲸监控", "📈 信号回测", "📰 每日报告"]
 )
 
 # ---------- Tab 1: 加密货币关注 ----------
@@ -219,56 +219,139 @@ with tab2:
             render_watchlist_row(r, show_whale=False)
 
 
-# ---------- Tab 3: 新币动量扫描 ----------
+# ---------- Tab 3: 挖掘机会（新币早期 / 二级市场强势 / 一级市场融资） ----------
 with tab3:
-    st.caption("点击下方按钮开始扫描；结果按综合热度评分从高到低排序，评分构成会拆开显示，不是黑箱数字")
+    sub1, sub2, sub3 = st.tabs(["🌱 新币早期扫描", "🔥 二级市场强势", "🏦 一级市场融资"])
 
-    if st.button("🔍 开始扫描新币", type="primary"):
-        with st.spinner("正在扫描新币，请稍候..."):
-            candidates = core.scan_new_coins(
-                chains, min_liquidity, min_volume, min_change_1h,
-                run_security_check, with_background=run_background,
+    # --- 3a: 新币早期扫描（微盘新币，DexScreener） ---
+    with sub1:
+        st.caption("点击下方按钮开始扫描；结果按综合热度评分从高到低排序，评分构成会拆开显示，不是黑箱数字")
+
+        if st.button("🔍 开始扫描新币", type="primary"):
+            with st.spinner("正在扫描新币，请稍候..."):
+                candidates = core.scan_new_coins(
+                    chains, min_liquidity, min_volume, min_change_1h,
+                    run_security_check, with_background=run_background,
+                )
+            st.session_state["candidates"] = candidates
+
+        candidates = st.session_state.get("candidates", [])
+
+        if not candidates:
+            st.info("还没有扫描结果，点击上方按钮开始")
+        else:
+            st.success(f"发现 {len(candidates)} 个候选标的，按综合热度评分排序")
+            for c in candidates:
+                flag = "✅" if c["safe"] else ("🚫" if c["safe"] is False else "❔")
+                with st.container(border=True):
+                    mc = f"　市值: ${c['market_cap']:,.0f}" if c.get("market_cap") else ""
+                    st.markdown(f"### #{c['rank']} {flag} {c['symbol']} ({c['chain']})　热度评分 {c['score']:.0f}")
+
+                    if c.get("score_breakdown"):
+                        parts = "　".join(f"{k} {v:+.1f}" for k, v in c["score_breakdown"].items())
+                        st.caption(f"评分构成：{parts}")
+
+                    st.write(f"价格: ${c['price']}　1h涨幅: {c['change_1h']:+.1f}%　流动性: ${c['liquidity']:,.0f}　24h量: ${c['volume_24h']:,.0f}{mc}")
+                    st.write(f"安全检测: {c['reason']}")
+
+                    if c.get("whale") and c["whale"].get("top10_pct") is not None:
+                        w = c["whale"]
+                        st.write(f"🐋 前10地址持仓占比: {w['top10_pct']:.1f}%　持有人数: {w.get('holder_count','—')}")
+
+                    if c.get("background"):
+                        bg = c["background"]
+                        st.markdown(f"**项目简介**：{bg['description']}")
+                        if bg["links"]:
+                            link_str = "　".join(
+                                f"[{l.get('type', l.get('label','link'))}]({l.get('url')})" for l in bg["links"] if l.get("url")
+                            )
+                            st.markdown(f"**相关链接**：{link_str}")
+                        st.markdown("**投资参考要点**：")
+                        for note in bg["notes"]:
+                            st.write(f"• {note}")
+
+                    st.markdown(f"[在 DexScreener 查看]({c['url']})")
+
+            st.caption("⚠️ 综合热度评分是涨幅+换手强度+买卖力量的加权结果，用于排序参考，不构成投资建议")
+
+    # --- 3b: 二级市场强势（已有一定市值、正被广泛关注、有叙事有背景） ---
+    with sub2:
+        st.caption(
+            "数据源：CoinGecko trending（全网实时搜索热度Top7），跟左边'新币早期扫描'互补——"
+            "那边挖的是刚起步的微盘新币，这里是已经有一定市值、正被广泛关注、叙事和背景都比较清晰的项目"
+        )
+
+        if st.button("🔥 查看当前热门", type="primary"):
+            with st.spinner("正在获取trending数据和项目背景..."):
+                trending_results, trending_err = core.scan_trending_secondary(cg_key)
+            st.session_state["trending_results"] = trending_results
+            st.session_state["trending_err"] = trending_err
+
+        trending_results = st.session_state.get("trending_results")
+        trending_err = st.session_state.get("trending_err")
+
+        if trending_err:
+            st.warning(trending_err)
+        elif not trending_results:
+            st.info("还没有数据，点击上方按钮获取")
+        else:
+            for t in trending_results:
+                with st.container(border=True):
+                    rank_str = f"　市值排名 #{t['market_cap_rank']}" if t.get("market_cap_rank") else ""
+                    mc_str = f"　市值 ${t['market_cap']:,.0f}" if t.get("market_cap") else ""
+                    st.markdown(f"### 🔥#{t['search_rank']} {t['name']}（{t['symbol']}）{rank_str}")
+                    change7 = f"　7d {t['change_7d']:+.1f}%" if t.get("change_7d") is not None else ""
+                    st.write(f"价格: ${t['price']}　24h {t['change_24h']:+.1f}%{change7}{mc_str}")
+                    if t.get("categories"):
+                        st.markdown(f"**赛道/叙事**：{' / '.join(t['categories'])}")
+                    st.markdown(f"**项目背景**：{t['description']}")
+
+            st.caption("⚠️ trending反映的是'现在很多人在搜'，不代表基本面优质或价格合理，追高风险请自行判断")
+
+    # --- 3c: 一级市场融资（早期布局参考） ---
+    with sub3:
+        st.caption(
+            "数据源：DefiLlama公开融资数据（非官方文档列出的正式接口，字段结构没有官方保证，"
+            "如果拉取失败会提示你去 defillama.com/raises 手动查看）。命中知名机构会优先排在前面"
+        )
+
+        pc1, pc2 = st.columns([1, 3])
+        raise_days = pc1.selectbox("时间范围", [7, 14, 30, 60, 90], index=2)
+
+        if st.button("🏦 查看近期融资", type="primary"):
+            with st.spinner("正在获取融资数据..."):
+                raises_results, raises_err = core.fetch_primary_market_raises(days=raise_days)
+            st.session_state["raises_results"] = raises_results
+            st.session_state["raises_err"] = raises_err
+
+        raises_results = st.session_state.get("raises_results")
+        raises_err = st.session_state.get("raises_err")
+
+        if raises_err:
+            st.warning(raises_err)
+        elif not raises_results:
+            st.info("还没有数据，点击上方按钮获取")
+        else:
+            for r in raises_results:
+                with st.container(border=True):
+                    star = "⭐ " if r["tier1_hit"] else ""
+                    amount_str = f"${r['amount']}M" if r.get("amount") else "金额未披露"
+                    st.markdown(f"### {star}{r['name']}　{amount_str}　{r.get('round') or ''}")
+                    st.write(f"日期: {r['date']}　赛道: {r.get('category') or '—'}　链: {'/'.join(r['chains']) or '—'}")
+                    if r["lead_investors"]:
+                        st.markdown(f"**领投**：{'、'.join(r['lead_investors'])}")
+                    if r["other_investors"]:
+                        st.markdown(f"**跟投**：{'、'.join(r['other_investors'])}")
+                    if r["tier1_hit"]:
+                        st.caption(f"⭐ 看好理由：{('、'.join(r['tier1_hit']))} 是知名一二线加密VC，参投通常代表经过了较严格的尽调")
+                    if r.get("source"):
+                        st.markdown(f"[查看来源]({r['source']})")
+
+            st.caption(
+                "⚠️ 融资只代表机构在这个阶段愿意投钱，不代表项目一定成功，也不代表代币会立刻在二级市场上线；"
+                "一级市场投资流动性极差、大概率长期锁仓，个人一般没有渠道直接参与，这里主要是帮你提前'认识'这些项目，"
+                "等它们未来上二级市场时，你已经比别人多了一层背景认知"
             )
-        st.session_state["candidates"] = candidates
-
-    candidates = st.session_state.get("candidates", [])
-
-    if not candidates:
-        st.info("还没有扫描结果，点击上方按钮开始")
-    else:
-        st.success(f"发现 {len(candidates)} 个候选标的，按综合热度评分排序")
-        for c in candidates:
-            flag = "✅" if c["safe"] else ("🚫" if c["safe"] is False else "❔")
-            with st.container(border=True):
-                mc = f"　市值: ${c['market_cap']:,.0f}" if c.get("market_cap") else ""
-                st.markdown(f"### #{c['rank']} {flag} {c['symbol']} ({c['chain']})　热度评分 {c['score']:.0f}")
-
-                if c.get("score_breakdown"):
-                    parts = "　".join(f"{k} {v:+.1f}" for k, v in c["score_breakdown"].items())
-                    st.caption(f"评分构成：{parts}")
-
-                st.write(f"价格: ${c['price']}　1h涨幅: {c['change_1h']:+.1f}%　流动性: ${c['liquidity']:,.0f}　24h量: ${c['volume_24h']:,.0f}{mc}")
-                st.write(f"安全检测: {c['reason']}")
-
-                if c.get("whale") and c["whale"].get("top10_pct") is not None:
-                    w = c["whale"]
-                    st.write(f"🐋 前10地址持仓占比: {w['top10_pct']:.1f}%　持有人数: {w.get('holder_count','—')}")
-
-                if c.get("background"):
-                    bg = c["background"]
-                    st.markdown(f"**项目简介**：{bg['description']}")
-                    if bg["links"]:
-                        link_str = "　".join(
-                            f"[{l.get('type', l.get('label','link'))}]({l.get('url')})" for l in bg["links"] if l.get("url")
-                        )
-                        st.markdown(f"**相关链接**：{link_str}")
-                    st.markdown("**投资参考要点**：")
-                    for note in bg["notes"]:
-                        st.write(f"• {note}")
-
-                st.markdown(f"[在 DexScreener 查看]({c['url']})")
-
-        st.caption("⚠️ 综合热度评分是涨幅+换手强度+买卖力量的加权结果，用于排序参考，不构成投资建议")
 
 
 # ---------- Tab 4: 巨鲸钱包监控 ----------
