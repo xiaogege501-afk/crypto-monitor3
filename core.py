@@ -38,6 +38,35 @@ CG_PLATFORM_MAP = {
     "polygon-pos": "polygon",
 }
 
+# 常见代号 -> CoinGecko 标准 id 的静态对照表
+# 覆盖这张表的币种，直接查表就能拿到id，不用消耗搜索接口的免费额度
+# （CoinGecko 免费公开接口限速只有 5~15次/分钟，很容易被限流，这张表能省下一大半调用）
+COMMON_TICKER_MAP = {
+    "btc": "bitcoin", "eth": "ethereum", "xrp": "ripple", "sol": "solana", "sui": "sui",
+    "bnb": "binancecoin", "ada": "cardano", "doge": "dogecoin", "dot": "polkadot",
+    "matic": "matic-network", "pol": "polygon-ecosystem-token", "ltc": "litecoin",
+    "trx": "tron", "link": "chainlink", "avax": "avalanche-2", "shib": "shiba-inu",
+    "uni": "uniswap", "atom": "cosmos", "xlm": "stellar", "near": "near", "apt": "aptos",
+    "arb": "arbitrum", "op": "optimism", "tia": "celestia", "inj": "injective-protocol",
+    "pepe": "pepe", "wif": "dogwifcoin", "bch": "bitcoin-cash", "etc": "ethereum-classic",
+    "fil": "filecoin", "icp": "internet-computer", "hbar": "hedera-hashgraph", "vet": "vechain",
+    "render": "render-token", "imx": "immutable-x", "stx": "blockstack", "algo": "algorand",
+    "fet": "fetch-ai", "sand": "the-sandbox", "mana": "decentraland", "aave": "aave",
+    "mkr": "maker", "ldo": "lido-dao", "grt": "the-graph", "rune": "thorchain",
+    "kas": "kaspa", "ftm": "fantom", "sei": "sei-network", "ton": "the-open-network",
+    "usdt": "tether", "usdc": "usd-coin", "wbtc": "wrapped-bitcoin", "leo": "leo-token",
+    "cro": "crypto-com-chain", "okb": "okb", "gt": "gatetoken",
+}
+
+
+def cg_params(extra, cg_api_key=None):
+    """给CoinGecko请求拼参数，如果填了免费Demo Key就带上（稳定30次/分钟），
+    不填的话用公开接口（只有5~15次/分钟，容易被限流）"""
+    params = dict(extra)
+    if cg_api_key:
+        params["x_cg_demo_api_key"] = cg_api_key
+    return params
+
 # 2026年FOMC议息会议日期（美联储官网公布的固定日程，每年年初会公布下一年的完整日程）
 # 到了2027年需要更新这个列表，我会到时候提醒你
 FOMC_MEETINGS_2026 = [
@@ -186,11 +215,11 @@ def get_fed_overview(fred_api_key=None):
 
 # ========== 市场概览：大盘温度计 ==========
 
-def get_market_overview():
+def get_market_overview(cg_api_key=None):
     """BTC 市占率 + 恐慌贪婪指数，帮你快速判断当前是普涨普跌还是分化行情"""
     btc_dominance = None
     try:
-        resp = requests.get(COINGECKO_GLOBAL_URL, timeout=15)
+        resp = requests.get(COINGECKO_GLOBAL_URL, params=cg_params({}, cg_api_key), timeout=15)
         resp.raise_for_status()
         btc_dominance = resp.json()["data"]["market_cap_percentage"].get("btc")
     except Exception:
@@ -210,39 +239,57 @@ def get_market_overview():
 
 # ========== 币种 id 解析（解决 sui / xrp 这类输错id查不到数据的问题）==========
 
-def resolve_coin_id(query):
-    """把用户输入的代号/名称/id 模糊匹配成 CoinGecko 标准 id
-    例如输入 'xrp' 会被匹配成 'ripple'，输入 'sui' 会匹配成 'sui'
-    找不到返回 None
+def resolve_coin_id(query, cg_api_key=None):
+    """把用户输入的代号/名称/id 解析成 CoinGecko 标准 id
+    例如输入 'xrp' 会被解析成 'ripple'，输入 'btc' 会解析成 'bitcoin'
+    第一步先查静态对照表（不消耗API额度），查不到再调用搜索接口
+    返回 (coin_id, error_message)，成功时 error_message 为 None
     """
     q = query.strip().lower()
-    try:
-        resp = requests.get(COINGECKO_SEARCH_URL, params={"query": q}, timeout=15)
-        resp.raise_for_status()
-        coins = resp.json().get("coins", [])
-    except Exception:
-        return None
+
+    if q in COMMON_TICKER_MAP:
+        return COMMON_TICKER_MAP[q], None
+
+    coins, last_error = None, None
+    for attempt in range(2):
+        try:
+            resp = requests.get(COINGECKO_SEARCH_URL, params=cg_params({"query": q}, cg_api_key), timeout=15)
+            if resp.status_code == 429:
+                last_error = "接口限流(429)"
+                time.sleep(2)
+                continue
+            resp.raise_for_status()
+            coins = resp.json().get("coins", [])
+            last_error = None
+            break
+        except Exception as e:
+            last_error = str(e)
+            time.sleep(1.5)
+
+    if coins is None:
+        return None, (
+            f"查询接口暂时不稳定（{last_error}），大概率是CoinGecko免费公开接口限速太严"
+            "（只有5~15次/分钟），建议在侧边栏填一个免费的CoinGecko Demo API Key，或稍后重试"
+        )
 
     if not coins:
-        return None
+        return None, "找不到这个币种，换成官方英文名/代号再试一次"
 
-    # 优先精确匹配 id 或代号(symbol)
     for c in coins:
         if c.get("id", "").lower() == q or c.get("symbol", "").lower() == q:
-            return c["id"]
+            return c["id"], None
 
-    # 否则取市值排名最靠前的候选，避免匹配到同名的小众山寨币
     ranked = [c for c in coins if c.get("market_cap_rank")]
     if ranked:
-        return min(ranked, key=lambda c: c["market_cap_rank"])["id"]
-    return coins[0]["id"]
+        return min(ranked, key=lambda c: c["market_cap_rank"])["id"], None
+    return coins[0]["id"], None
 
 
-def fetch_coin_platforms(coin_id):
+def fetch_coin_platforms(coin_id, cg_api_key=None):
     """查这个币在各条链上的合约地址，用于后续查持仓集中度"""
     url = COINGECKO_COIN_URL.format(id=coin_id)
-    params = {"localization": "false", "tickers": "false", "market_data": "false",
-              "community_data": "false", "developer_data": "false", "sparkline": "false"}
+    params = cg_params({"localization": "false", "tickers": "false", "market_data": "false",
+                         "community_data": "false", "developer_data": "false", "sparkline": "false"}, cg_api_key)
     try:
         resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
@@ -253,10 +300,10 @@ def fetch_coin_platforms(coin_id):
 
 # ========== 关注币种：状态与买卖提示 ==========
 
-def fetch_market_chart(coin_id, days=90):
+def fetch_market_chart(coin_id, days=90, cg_api_key=None):
     """拉取历史日线价格，用于计算 RSI / 均线。days=90 保证拿到的是按天粒度的数据"""
     url = COINGECKO_CHART_URL.format(id=coin_id)
-    params = {"vs_currency": "usd", "days": days}
+    params = cg_params({"vs_currency": "usd", "days": days}, cg_api_key)
     resp = requests.get(url, params=params, timeout=15)
     resp.raise_for_status()
     data = resp.json()
@@ -317,10 +364,10 @@ def get_concentration_info(chain, address):
     }
 
 
-def get_watchlist_whale_info(coin_id):
+def get_watchlist_whale_info(coin_id, cg_api_key=None):
     """给关注币种查一下主流 EVM 链上的合约地址，再查持仓集中度
     比特币这类原生资产、以及 Solana/XRP Ledger 等非 EVM 链暂不支持，返回 None"""
-    platforms = fetch_coin_platforms(coin_id)
+    platforms = fetch_coin_platforms(coin_id, cg_api_key)
     for cg_key, chain in CG_PLATFORM_MAP.items():
         address = platforms.get(cg_key)
         if address:
@@ -394,14 +441,14 @@ def compute_signal(prices, extra_rules=True):
     }
 
 
-def analyze_coin(raw_query):
+def analyze_coin(raw_query, cg_api_key=None):
     """综合价格、24h/7d涨跌、RSI、均线，给出一个状态提示 + 理由列表
     这是基于常见技术指标的规则打分，不是预测，仅作为你自己判断时的参考"""
-    coin_id = resolve_coin_id(raw_query)
+    coin_id, err = resolve_coin_id(raw_query, cg_api_key)
     if not coin_id:
-        return {"coin": raw_query, "error": "找不到这个币种，换成官方英文名或代号再试一次"}
+        return {"coin": raw_query, "error": err}
 
-    prices_daily = fetch_market_chart(coin_id, days=90)
+    prices_daily = fetch_market_chart(coin_id, days=90, cg_api_key=cg_api_key)
     sig = compute_signal(prices_daily)
     if sig is None:
         return {"coin": coin_id, "error": "历史数据不足，暂时无法分析"}
@@ -411,13 +458,13 @@ def analyze_coin(raw_query):
     return sig
 
 
-def analyze_watchlist(coin_ids, include_whale=False):
+def analyze_watchlist(coin_ids, include_whale=False, cg_api_key=None):
     results = []
     for coin_id in coin_ids:
         try:
-            r = analyze_coin(coin_id)
+            r = analyze_coin(coin_id, cg_api_key)
             if include_whale and "error" not in r:
-                r["whale"] = get_watchlist_whale_info(r["coin"])
+                r["whale"] = get_watchlist_whale_info(r["coin"], cg_api_key)
         except Exception as e:
             r = {"coin": coin_id, "error": f"获取数据失败: {e}"}
         results.append(r)
@@ -516,12 +563,12 @@ def backtest_signal(prices, forward_days=7, extra_rules=True):
     return {"total_samples": len(records), "summary": summary}
 
 
-def backtest_coin(raw_query, forward_days=7, days=365):
-    coin_id = resolve_coin_id(raw_query)
+def backtest_coin(raw_query, forward_days=7, days=365, cg_api_key=None):
+    coin_id, err = resolve_coin_id(raw_query, cg_api_key)
     if not coin_id:
-        return {"coin": raw_query, "error": "找不到这个币种"}
+        return {"coin": raw_query, "error": err}
     try:
-        prices = fetch_market_chart(coin_id, days=days)
+        prices = fetch_market_chart(coin_id, days=days, cg_api_key=cg_api_key)
     except Exception as e:
         return {"coin": coin_id, "error": f"获取历史数据失败: {e}"}
 
@@ -809,7 +856,7 @@ def fetch_wallet_activity(chain, address, api_key, limit=30):
 
         is_in = tx.get("to", "").lower() == address.lower()
         ts = tx.get("timeStamp")
-        time_str = datetime.datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M UTC") if ts else "—"
+        time_str = datetime.datetime.fromtimestamp(int(ts), tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if ts else "—"
 
         results.append({
             "time": time_str,
@@ -824,17 +871,109 @@ def fetch_wallet_activity(chain, address, api_key, limit=30):
     return results, None
 
 
+def get_address_type(chain, address, api_key):
+    """判断一个地址是普通钱包(EOA)还是合约地址，如果是已验证合约还能拿到合约名字
+    这是从Etherscan查到的客观事实（不是猜的），后面用来辅助判断"这笔转账可能是什么类型的操作" """
+    chain_id = GOPLUS_CHAIN_MAP.get(chain)
+    if not chain_id or not api_key:
+        return {"is_contract": None, "name": None}
+
+    try:
+        code_resp = requests.get(ETHERSCAN_V2_URL, params={
+            "chainid": chain_id, "module": "proxy", "action": "eth_getCode",
+            "address": address, "tag": "latest", "apikey": api_key,
+        }, timeout=15).json()
+        code = code_resp.get("result", "0x")
+        is_contract = code not in ("0x", "0x0", "", None)
+    except Exception:
+        return {"is_contract": None, "name": None}
+
+    name = None
+    if is_contract:
+        try:
+            src_resp = requests.get(ETHERSCAN_V2_URL, params={
+                "chainid": chain_id, "module": "contract", "action": "getsourcecode",
+                "address": address, "apikey": api_key,
+            }, timeout=15).json()
+            result = (src_resp.get("result") or [{}])[0]
+            name = result.get("ContractName") or None
+        except Exception:
+            pass
+
+    return {"is_contract": is_contract, "name": name}
+
+
+def build_whale_daily_report(chain, address, api_key, label=""):
+    """给某个巨鲸地址出一份"今天做了什么"的报告：
+    1. 按代币聚合今天的净流入/净流出（这是客观算出来的事实）
+    2. 查一下今天主要交易对手方是合约还是普通钱包、合约叫什么名字（客观查到的事实）
+    3. 基于以上两点给几条解读思路（明确框定为"可能性/建议核实方向"，不是确定结论——
+       链上数据本身不包含"意图"，任何"背后深意"的判断都需要你结合交易hash自行核实）
+    """
+    activity, error = fetch_wallet_activity(chain, address, api_key, limit=100)
+    if error:
+        return {"label": label, "address": address, "chain": chain, "error": error}
+
+    today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+    today_txs = [tx for tx in activity if tx["time"].startswith(today)]
+
+    if not today_txs:
+        return {"label": label, "address": address, "chain": chain, "has_activity": False, "date": today}
+
+    token_flows = {}
+    counterparties = {}
+    for tx in today_txs:
+        sym = tx["symbol"]
+        signed_amt = tx["amount"] if tx["direction"] == "转入" else -tx["amount"]
+        flow = token_flows.setdefault(sym, {"net": 0.0, "in_count": 0, "out_count": 0})
+        flow["net"] += signed_amt
+        flow["in_count" if tx["direction"] == "转入" else "out_count"] += 1
+        counterparties.setdefault(tx["counterparty"], []).append(tx)
+
+    # 只查交易笔数最多的前5个对手方的地址类型，避免请求太多超出免费额度
+    top_counterparties = sorted(counterparties.items(), key=lambda kv: len(kv[1]), reverse=True)[:5]
+    hypothesis = []
+    for cp_addr, txs in top_counterparties:
+        info = get_address_type(chain, cp_addr, api_key)
+        time.sleep(0.2)
+        n_tx = len(txs)
+        short_addr = f"{cp_addr[:10]}...{cp_addr[-6:]}"
+        if info.get("is_contract"):
+            name = info.get("name") or "未在Etherscan验证的合约"
+            hypothesis.append({
+                "counterparty": cp_addr, "short": short_addr, "tx_count": n_tx, "type": "合约",
+                "note": f"对手方是合约「{name}」，发生了{n_tx}笔交易。如果这是DEX路由/聚合器类合约，"
+                        f"可能是在做链上swap（换币）；具体换成了什么、金额是否对等，建议点交易hash到"
+                        f"区块浏览器看完整的调用记录再判断",
+            })
+        elif info.get("is_contract") is False:
+            hypothesis.append({
+                "counterparty": cp_addr, "short": short_addr, "tx_count": n_tx, "type": "普通钱包",
+                "note": f"对手方是普通钱包地址，发生了{n_tx}笔交易。更像是钱包间转账，可能是资金归集、"
+                        f"分仓到多个地址，或者转给别人，链上数据本身看不出具体意图",
+            })
+        else:
+            hypothesis.append({
+                "counterparty": cp_addr, "short": short_addr, "tx_count": n_tx, "type": "未知",
+                "note": "地址类型没查到，需要你自己去区块浏览器核实",
+            })
+
+    return {
+        "label": label, "address": address, "chain": chain, "has_activity": True,
+        "date": today, "tx_count": len(today_txs), "token_flows": token_flows,
+        "hypothesis": hypothesis, "raw_txs": today_txs,
+    }
+
+
 def monitor_whale_wallets(wallets, api_key):
-    """wallets: [{"chain": "ethereum", "address": "0x...", "label": "自定义备注名"}]"""
+    """wallets: [{"chain": "ethereum", "address": "0x...", "label": "自定义备注名"}]
+    给每个地址生成一份"今天做了什么"的报告"""
     results = []
     for w in wallets:
-        chain, address = w["chain"], w["address"]
+        chain, address, label = w["chain"], w["address"], w.get("label", "")
         balance = fetch_wallet_balance(chain, address, api_key)
-        activity, error = fetch_wallet_activity(chain, address, api_key)
-        results.append({
-            "label": w.get("label") or address[:10] + "...",
-            "chain": chain, "address": address,
-            "native_balance": balance, "activity": activity, "error": error,
-        })
+        report = build_whale_daily_report(chain, address, api_key, label)
+        report["native_balance"] = balance
+        results.append(report)
         time.sleep(0.3)
     return results

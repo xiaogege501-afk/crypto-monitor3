@@ -45,14 +45,15 @@ def render_watchlist_row(r, show_whale=False):
 
 # ---------- 顶部：市场概览 ----------
 @st.cache_data(ttl=300)
-def get_overview():
-    return core.get_market_overview()
+def get_overview(cg_key):
+    return core.get_market_overview(cg_key)
 
 @st.cache_data(ttl=1800)
 def get_fed_overview(fred_key):
     return core.get_fed_overview(fred_key)
 
-ov = get_overview()
+cg_key_saved = saved.get("cg_key", "")
+ov = get_overview(cg_key_saved)
 fed = get_fed_overview(saved.get("fred_key", ""))
 
 oc1, oc2, oc3, oc4 = st.columns(4)
@@ -90,8 +91,16 @@ st.divider()
 with st.sidebar:
     st.header("⚙️ 参数设置")
 
+    st.subheader("🦎 CoinGecko Demo Key（可选，强烈建议填）")
+    st.caption(
+        "免费公开接口只有5~15次/分钟，很容易被限流导致'获取数据失败'。"
+        "免费申请：coingecko.com/en/api/pricing → Create Free Account，几分钟搞定"
+    )
+    cg_key = st.text_input("CoinGecko Demo API Key", value=saved.get("cg_key", ""), type="password")
+
+    st.divider()
     st.subheader("👀 关注加密货币")
-    st.caption("每行一个，支持直接写代号/名称（如 xrp、sui），会自动识别")
+    st.caption("每行一个，直接写代号就行（如 btc、eth、xrp、sui），不用查全称")
     watchlist_text = st.text_area(
         "币种列表", value=saved.get("watchlist_text", "bitcoin\nethereum\nsolana\nxrp\nsui"),
         height=120, label_visibility="collapsed"
@@ -140,6 +149,7 @@ with st.sidebar:
     st.divider()
     if st.button("💾 保存当前设置", type="primary", use_container_width=True):
         cfg = {
+            "cg_key": cg_key,
             "watchlist_text": watchlist_text, "forex_text": forex_text,
             "show_whale_watchlist": show_whale_watchlist,
             "min_liquidity": min_liquidity, "min_volume": min_volume, "min_change_1h": min_change_1h,
@@ -164,15 +174,15 @@ with tab1:
         st.cache_data.clear()
 
     @st.cache_data(ttl=120)
-    def get_watchlist_analysis(coin_ids, include_whale):
-        return core.analyze_watchlist(coin_ids, include_whale=include_whale)
+    def get_watchlist_analysis(coin_ids, include_whale, cg_key_):
+        return core.analyze_watchlist(coin_ids, include_whale=include_whale, cg_api_key=cg_key_)
 
     if not watchlist:
         st.info("请在左侧输入你想关注的币种")
         watchlist_results = []
     else:
         with st.spinner("正在获取数据并计算指标..."):
-            watchlist_results = get_watchlist_analysis(tuple(watchlist), show_whale_watchlist)
+            watchlist_results = get_watchlist_analysis(tuple(watchlist), show_whale_watchlist, cg_key)
         for r in watchlist_results:
             render_watchlist_row(r, show_whale=show_whale_watchlist)
 
@@ -255,8 +265,9 @@ with tab3:
 # ---------- Tab 4: 巨鲸钱包监控 ----------
 with tab4:
     st.caption(
-        "只展示指定地址最近的转入/转出记录，不会自动判断'这是不是交易所'或'是买入还是卖出'，"
-        "请点交易哈希去区块浏览器自行核实。仅覆盖以太坊/BSC/Base/Arbitrum/Polygon等EVM链"
+        "针对每个地址生成一份'今天做了什么'的报告：按代币聚合净流入/净流出（客观算出来的事实），"
+        "并查一下主要交易对手方是合约还是普通钱包（从Etherscan查到的客观事实）。"
+        "解读部分明确是'可能性/建议核实方向'，链上数据本身不包含意图，不会帮你下'这是买入还是卖出'的定论"
     )
 
     wallets = []
@@ -270,7 +281,7 @@ with tab4:
     elif not wallets:
         st.info("请在左侧按 `链,地址,备注` 的格式，添加你想监控的巨鲸钱包地址")
     else:
-        if st.button("🔄 刷新巨鲸活动", key="refresh_whale"):
+        if st.button("📋 生成今日报告", key="refresh_whale", type="primary"):
             st.cache_data.clear()
 
         @st.cache_data(ttl=180)
@@ -279,27 +290,54 @@ with tab4:
             return core.monitor_whale_wallets(wallets_list, api_key)
 
         wallets_tuple = tuple((w["chain"], w["address"], w["label"]) for w in wallets)
-        with st.spinner("正在查询链上活动..."):
+        with st.spinner("正在查询链上活动、识别对手方地址类型，可能需要十几秒..."):
             whale_results = get_whale_data(wallets_tuple, etherscan_key)
 
         for w in whale_results:
             with st.container(border=True):
                 bal = f"　原生代币余额: {w['native_balance']:.4f}" if w.get("native_balance") is not None else ""
-                st.markdown(f"### 🐋 {w['label']}　`{w['address'][:10]}...{w['address'][-6:]}`（{w['chain']}）{bal}")
+                st.markdown(f"### 🐋 {w['label'] or w['address'][:10]}　`{w['address'][:10]}...{w['address'][-6:]}`（{w['chain']}）{bal}")
 
                 if w.get("error"):
                     st.warning(w["error"])
                     continue
 
-                if not w["activity"]:
-                    st.caption("近期没有代币转账记录")
-                else:
-                    for tx in w["activity"][:15]:
+                if not w.get("has_activity"):
+                    st.caption(f"{w.get('date','今天')} 没有代币转账记录")
+                    continue
+
+                st.caption(f"{w['date']}　共 {w['tx_count']} 笔代币转账")
+
+                st.markdown("**📊 今日净流入/流出（按代币聚合）**")
+                for sym, flow in w["token_flows"].items():
+                    if flow["net"] > 0:
+                        st.write(f"🟢 净流入 **{flow['net']:,.4f} {sym}**（{flow['in_count']}笔转入 / {flow['out_count']}笔转出）")
+                    elif flow["net"] < 0:
+                        st.write(f"🔴 净流出 **{abs(flow['net']):,.4f} {sym}**（{flow['in_count']}笔转入 / {flow['out_count']}笔转出）")
+                    else:
+                        st.write(f"⚪ {sym} 转入转出基本抵消（{flow['in_count']}笔转入 / {flow['out_count']}笔转出）")
+
+                if w.get("hypothesis"):
+                    st.markdown("**🔍 主要交易对手方分析**")
+                    for h in w["hypothesis"]:
+                        icon = "📜" if h["type"] == "合约" else ("👛" if h["type"] == "普通钱包" else "❔")
+                        st.write(f"{icon} `{h['short']}`（{h['tx_count']}笔）")
+                        st.caption(h["note"])
+
+                with st.expander("查看今天的完整流水明细"):
+                    explorer_domain = {
+                        "ethereum": "etherscan.io", "bsc": "bscscan.com", "base": "basescan.org",
+                        "arbitrum": "arbiscan.io", "polygon": "polygonscan.com",
+                    }.get(w["chain"], "etherscan.io")
+                    for tx in w["raw_txs"]:
                         arrow = "⬅️ 转入" if tx["direction"] == "转入" else "➡️ 转出"
                         st.write(
                             f"{tx['time']}　{arrow}　**{tx['amount']:,.4f} {tx['symbol']}**　"
-                            f"对手方: `{tx['counterparty'][:10]}...`"
+                            f"对手方: `{tx['counterparty'][:10]}...`　"
+                            f"[查看交易](https://{explorer_domain}/tx/{tx['hash']})"
                         )
+
+        st.caption("⚠️ 净流入/流出是客观计算出来的事实；对手方分析是基于合约验证信息的推测方向，不是确定结论，请点交易链接自行核实后再做判断")
 
 
 # ---------- Tab 5: 信号回测 ----------
@@ -317,7 +355,7 @@ with tab5:
     if st.button("📈 开始回测", type="primary"):
         with st.spinner("正在拉取历史数据并回放规则，可能需要十几秒..."):
             if bt_type == "加密货币":
-                bt_result = core.backtest_coin(bt_query, forward_days=bt_forward)
+                bt_result = core.backtest_coin(bt_query, forward_days=bt_forward, cg_api_key=cg_key)
             else:
                 bt_result = core.backtest_forex(bt_query, forward_days=bt_forward)
         st.session_state["bt_result"] = bt_result
