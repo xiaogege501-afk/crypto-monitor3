@@ -20,6 +20,11 @@ ETHERSCAN_V2_URL = "https://api.etherscan.io/v2/api"
 FRED_URL = "https://api.stlouisfed.org/fred/series/observations"
 BINANCE_FAPI = "https://fapi.binance.com/fapi/v1"
 BINANCE_FUTURES_DATA = "https://fapi.binance.com/futures/data"
+# Binance 对美国地区的云服务器IP有地域限制（会返回451），Streamlit Cloud/Hugging Face等
+# 免费平台大概率跑在美国的云机房，所以经常连不上Binance。Bybit 作为备用数据源，
+# 通常对这类云服务器IP限制没那么严格
+BYBIT_MARKET = "https://api.bybit.com/v5/market"
+BYBIT_INTERVAL_MAP = {"15m": "15", "1h": "60", "1d": "D", "1w": "W"}
 CONFIG_PATH = "user_config.json"
 
 # 链名 -> GoPlus 需要的数字 chain_id（覆盖常见 EVM 链）
@@ -643,40 +648,73 @@ def guess_exchange_ticker(coin_id, raw_query):
     return None
 
 
+def fetch_bybit_funding_rate(ticker):
+    symbol = ticker.upper() + "USDT"
+    try:
+        resp = requests.get(f"{BYBIT_MARKET}/funding/history",
+                             params={"category": "linear", "symbol": symbol, "limit": 1}, timeout=10)
+        if resp.status_code != 200:
+            return None
+        rows = (resp.json().get("result") or {}).get("list") or []
+        if not rows:
+            return None
+        return {"symbol": symbol, "funding_rate_pct": float(rows[0]["fundingRate"]) * 100, "mark_price": None}
+    except Exception:
+        return None
+
+
 def fetch_funding_rate(ticker):
-    """永续合约资金费率，正值代表多头付钱给空头（多头拥挤），负值反过来"""
+    """永续合约资金费率，正值代表多头付钱给空头（多头拥挤），负值反过来
+    优先用Binance，连不上（比如被地域限制）就自动换Bybit"""
     symbol = ticker.upper() + "USDT"
     try:
         resp = requests.get(f"{BINANCE_FAPI}/premiumIndex", params={"symbol": symbol}, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if "lastFundingRate" in data:
+                return {
+                    "symbol": symbol, "funding_rate_pct": float(data["lastFundingRate"]) * 100,
+                    "mark_price": float(data.get("markPrice", 0)),
+                }
+    except Exception:
+        pass
+    return fetch_bybit_funding_rate(ticker)
+
+
+def fetch_bybit_open_interest(ticker, days=7):
+    symbol = ticker.upper() + "USDT"
+    try:
+        resp = requests.get(f"{BYBIT_MARKET}/open-interest",
+                             params={"category": "linear", "symbol": symbol, "intervalTime": "1d", "limit": days},
+                             timeout=10)
         if resp.status_code != 200:
             return None
-        data = resp.json()
-        if "lastFundingRate" not in data:
+        rows = (resp.json().get("result") or {}).get("list") or []
+        if not rows:
             return None
-        return {
-            "symbol": symbol, "funding_rate_pct": float(data["lastFundingRate"]) * 100,
-            "mark_price": float(data.get("markPrice", 0)),
-        }
+        rows = list(reversed(rows))
+        values = [float(r["openInterest"]) for r in rows]
+        change_pct = (values[-1] - values[0]) / values[0] * 100 if values[0] else 0
+        return {"symbol": symbol, "current": values[-1], "change_pct": change_pct, "days": len(values)}
     except Exception:
         return None
 
 
 def fetch_open_interest_trend(ticker, days=7):
-    """未平仓合约总价值(USD)近几天的变化趋势"""
+    """未平仓合约总价值近几天的变化趋势，优先Binance，连不上就换Bybit"""
     symbol = ticker.upper() + "USDT"
     try:
         resp = requests.get(f"{BINANCE_FUTURES_DATA}/openInterestHist",
                              params={"symbol": symbol, "period": "1d", "limit": days}, timeout=10)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        if not data:
-            return None
-        values = [float(d["sumOpenInterestValue"]) for d in data]
-        change_pct = (values[-1] - values[0]) / values[0] * 100 if values[0] else 0
-        return {"symbol": symbol, "current": values[-1], "change_pct": change_pct, "days": len(values)}
+        if resp.status_code == 200:
+            data = resp.json()
+            if data:
+                values = [float(d["sumOpenInterestValue"]) for d in data]
+                change_pct = (values[-1] - values[0]) / values[0] * 100 if values[0] else 0
+                return {"symbol": symbol, "current": values[-1], "change_pct": change_pct, "days": len(values)}
     except Exception:
-        return None
+        pass
+    return fetch_bybit_open_interest(ticker, days)
 
 
 def analyze_derivatives(ticker, change_24h=None):
@@ -729,20 +767,41 @@ def analyze_derivatives(ticker, change_24h=None):
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 
 
+def fetch_bybit_klines(ticker, interval, limit=200):
+    symbol = ticker.upper() + "USDT"
+    bybit_interval = BYBIT_INTERVAL_MAP.get(interval)
+    if not bybit_interval:
+        return None
+    try:
+        resp = requests.get(f"{BYBIT_MARKET}/kline",
+                             params={"category": "linear", "symbol": symbol, "interval": bybit_interval, "limit": limit},
+                             timeout=10)
+        if resp.status_code != 200:
+            return None
+        rows = (resp.json().get("result") or {}).get("list") or []
+        if not rows:
+            return None
+        rows = list(reversed(rows))  # Bybit返回是从新到旧，反转成从旧到新
+        closes = [float(r[4]) for r in rows]
+        return {"closes": closes, "last_close_time_ms": int(rows[-1][0])}
+    except Exception:
+        return None
+
+
 def fetch_binance_klines(ticker, interval, limit=300):
-    """interval: 15m / 1h / 1d / 1w 等Binance支持的周期写法"""
+    """interval: 15m / 1h / 1d / 1w 等Binance支持的周期写法
+    优先用Binance，连不上（比如被地域限制）就自动换Bybit（内部会转换成Bybit的周期写法）"""
     symbol = ticker.upper() + "USDT"
     try:
         resp = requests.get(BINANCE_KLINES_URL, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=15)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        if not data or isinstance(data, dict):  # 出错时Binance会返回一个带code字段的dict而不是列表
-            return None
-        closes = [float(k[4]) for k in data]
-        return {"closes": closes, "last_close_time_ms": data[-1][6]}
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and not isinstance(data, dict):  # 出错时Binance会返回一个带code字段的dict而不是列表
+                closes = [float(k[4]) for k in data]
+                return {"closes": closes, "last_close_time_ms": data[-1][6]}
     except Exception:
-        return None
+        pass
+    return fetch_bybit_klines(ticker, interval, limit)
 
 
 def resample_to_periods(daily_prices, period_days):
