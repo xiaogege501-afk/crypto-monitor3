@@ -32,13 +32,14 @@ def render_reason_list(reasons):
             st.write(f"{i}. {text}")
 
 
-def render_watchlist_row(r, show_whale=False, is_crypto=True):
+def render_watchlist_row(r, show_whale=False, is_crypto=True, show_resonance=False):
     display_name = r.get("display", r.get("query", r.get("coin", "?")))
     if "error" in r:
         st.warning(f"**{display_name}**：{r['error']}")
         return
 
     change7 = f"　7d {r['change_7d']:+.1f}%" if r.get("change_7d") is not None else ""
+    tf_note = "日线" if is_crypto else "日线(外汇日频数据)"
 
     with st.container(border=True):
         st.markdown(
@@ -46,16 +47,14 @@ def render_watchlist_row(r, show_whale=False, is_crypto=True):
             f"24h {r['change_24h']:+.1f}%{change7}　:{LEVEL_COLOR.get(r['level'],'gray')}[{r['label']}]"
         )
 
-        st.markdown("**技术面理由：**")
+        st.markdown(f"**技术面理由（{tf_note}）：**")
         render_reason_list(r["reasons"])
 
-        if show_whale:
-            if r.get("whale"):
-                w = r["whale"]
-                if w.get("top10_pct") is not None:
-                    st.write(f"🐋 前10持仓占比 {w['top10_pct']:.1f}%（持有人数 {w.get('holder_count', '—')}）")
-            else:
-                st.caption("🐋 该链暂不支持集中度检测")
+        if show_whale and r.get("whale"):
+            w = r["whale"]
+            if w.get("top10_pct") is not None:
+                st.write(f"🐋 前10持仓占比 {w['top10_pct']:.1f}%（持有人数 {w.get('holder_count', '—')}）")
+            # 查不到集中度数据（比如该链暂不支持）就什么都不显示，不用一句提示占地方
 
         deriv = r.get("derivatives")
         if deriv:
@@ -69,10 +68,16 @@ def render_watchlist_row(r, show_whale=False, is_crypto=True):
                 else:
                     st.write(f"{i}. {text}")
 
-        mtf = r.get("resonance_data")
-        if mtf:
-            st.markdown("**📊 多周期共振：**")
-            render_resonance_panel(mtf, is_crypto=is_crypto, compact=True)
+        if show_resonance:
+            mtf = r.get("resonance_data")
+            tf_label = "15分钟/1小时/日线/周线" if is_crypto else "日线/周线/月线"
+            st.markdown(f"**📊 多周期共振（{tf_label}）：**")
+            if mtf:
+                render_resonance_panel(mtf, is_crypto=is_crypto, compact=True)
+            else:
+                st.caption("这个币暂时没查到多周期K线数据（可能是交易所没有这个币的合约/交易对，或者请求暂时失败），刷新一次再试试")
+
+
 
 
 def render_resonance_panel(mtf_data, is_crypto=True, compact=False):
@@ -166,6 +171,18 @@ else:
     st.caption(risk_signal["note"])
     for line in risk_signal.get("framework", []):
         st.caption(f"• {line}")
+
+# ---------- 近期重要宏观事件提醒 ----------
+macro = core.get_macro_risk_advisory(caution_days=3)
+if macro["imminent"]:
+    lines = [f"{e['date'].isoformat()}（{e['days_until']}天后）：{e['name']}" for e in macro["imminent"]]
+    st.error(
+        "🚨 **近期临近重要宏观事件，建议空仓观望，不要轻易下单**\n\n" + "\n\n".join(lines) +
+        "\n\n数据/决议公布前后市场波动通常会明显放大，仓位控制比平时更重要"
+    )
+elif macro["events"]:
+    lines = [f"{e['date'].isoformat()}（{e['days_until']}天后）：{e['name']}" for e in macro["events"][:3]]
+    st.info("📅 **近期重要宏观事件**：" + "　".join(lines))
 
 st.divider()
 
@@ -273,7 +290,7 @@ with tab1:
                 tuple(watchlist), show_whale_watchlist, cg_key, show_derivatives, show_resonance
             )
         for r in watchlist_results:
-            render_watchlist_row(r, show_whale=show_whale_watchlist, is_crypto=True)
+            render_watchlist_row(r, show_whale=show_whale_watchlist, is_crypto=True, show_resonance=show_resonance)
 
 
 # ---------- Tab 2: 外汇关注 ----------
@@ -296,7 +313,7 @@ with tab2:
         with st.spinner("正在获取汇率数据并计算指标..."):
             forex_results = get_forex_analysis(tuple(forex_watchlist), show_resonance)
         for r in forex_results:
-            render_watchlist_row(r, show_whale=False, is_crypto=False)
+            render_watchlist_row(r, show_whale=False, is_crypto=False, show_resonance=show_resonance)
 
 
 # ---------- Tab 3: 挖掘机会（新币早期 / 二级市场强势 / 一级市场融资） ----------
@@ -515,40 +532,58 @@ with tab4:
 # ---------- Tab 5: 信号回测 ----------
 with tab5:
     st.caption(
-        "把左侧的 RSI/均线打分规则，套用到这个币种/货币对过去每一天的真实历史价格上，"
-        "统计每种信号等级出现后，未来N天的真实涨跌胜率——这是真实回放出来的数据，不是编的"
+        "把左侧的打分规则，套用到过去每一天的真实历史价格上，统计每种信号等级出现后，"
+        "未来N天的真实涨跌胜率——这是真实回放出来的数据，不是编的"
     )
 
     bc1, bc2, bc3 = st.columns([2, 1, 1])
-    bt_query = bc1.text_input("要回测的币种或货币对", value="bitcoin", placeholder="bitcoin 或 USD/JPY")
-    bt_type = bc2.selectbox("类型", ["加密货币", "外汇"])
-    bt_forward = bc3.selectbox("往后看几天", [3, 7, 14, 30], index=1)
+    bt_type = bc1.selectbox("类型", ["加密货币", "外汇"], key="bt_type")
 
-    if st.button("📈 开始回测", type="primary"):
-        with st.spinner("正在拉取历史数据并回放规则，可能需要十几秒..."):
-            if bt_type == "加密货币":
-                bt_result = core.backtest_coin(bt_query, forward_days=bt_forward, cg_api_key=cg_key)
-            else:
-                bt_result = core.backtest_forex(bt_query, forward_days=bt_forward)
-        st.session_state["bt_result"] = bt_result
+    if bt_type == "加密货币":
+        options = list(watchlist) + ["全部关注币种"] if watchlist else ["（左侧还没填关注币种）"]
+    else:
+        options = list(forex_watchlist) + ["全部关注货币对"] if forex_watchlist else ["（左侧还没填关注货币对）"]
 
-    bt_result = st.session_state.get("bt_result")
-    if bt_result:
-        if bt_result.get("error"):
-            st.warning(bt_result["error"])
-        else:
-            st.success(f"{bt_result['coin'].upper()}　共回放 {bt_result['total_samples']} 个历史样本点")
-            for s in bt_result["summary"]:
-                bar_color = LEVEL_COLOR.get(s["level"], "gray")
-                st.markdown(
-                    f":{bar_color}[{s['label']}]　出现 {s['count']} 次　"
-                    f"未来{bt_result['forward_days']}天上涨概率 **{s['win_rate']:.0f}%**　"
-                    f"平均涨跌 **{s['avg_return']:+.1f}%**"
-                )
-            st.caption(
-                "⚠️ 历史胜率不代表未来一定重复，样本量较小时（比如新币种历史数据不到一年）"
-                "统计意义有限，仅供参考"
-            )
+    bt_scope = bc2.selectbox("选择要回测的对象", options, key="bt_scope")
+    bt_forward = bc3.selectbox("往后看几天", [3, 7, 14, 30], index=1, key="bt_forward")
+
+    is_batch = bt_scope.startswith("全部")
+    is_placeholder = bt_scope.startswith("（")
+
+    if st.button("📈 开始回测", type="primary", disabled=is_placeholder):
+        targets = (watchlist if bt_type == "加密货币" else forex_watchlist) if is_batch else [bt_scope]
+        batch_results = []
+        with st.spinner(f"正在回测 {len(targets)} 个标的，可能需要一点时间..."):
+            for t in targets:
+                if bt_type == "加密货币":
+                    res = core.backtest_coin(t, forward_days=bt_forward, cg_api_key=cg_key)
+                else:
+                    res = core.backtest_forex(t, forward_days=bt_forward)
+                res["display"] = t.strip().upper()
+                batch_results.append(res)
+        st.session_state["bt_results"] = batch_results
+        st.session_state["bt_forward_used"] = bt_forward
+
+    bt_results = st.session_state.get("bt_results")
+    if bt_results:
+        for bt_result in bt_results:
+            with st.container(border=True):
+                st.markdown(f"#### {bt_result.get('display', bt_result.get('coin','?'))}")
+                if bt_result.get("error"):
+                    st.warning(bt_result["error"])
+                    continue
+                st.caption(f"共回放 {bt_result['total_samples']} 个历史样本点")
+                for s in bt_result["summary"]:
+                    bar_color = LEVEL_COLOR.get(s["level"], "gray")
+                    st.markdown(
+                        f":{bar_color}[{s['label']}]　出现 {s['count']} 次　"
+                        f"未来{bt_result['forward_days']}天上涨概率 **{s['win_rate']:.0f}%**　"
+                        f"平均涨跌 **{s['avg_return']:+.1f}%**"
+                    )
+        st.caption(
+            "⚠️ 历史胜率不代表未来一定重复，样本量较小时（比如新币种历史数据不到一年）"
+            "统计意义有限，仅供参考"
+        )
 
 
 # ---------- Tab 6: 每日报告 ----------

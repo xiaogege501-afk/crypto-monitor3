@@ -98,6 +98,60 @@ FOMC_MEETINGS_2026 = [
     ("2026-12-08", "2026-12-09"),
 ]
 
+# 2026年美国CPI公布日期（来源：美国劳工统计局BLS官方日程，https://www.bls.gov/schedule/news_release/cpi.htm）
+# 到了2027年需要更新这个列表
+CPI_DATES_2026 = [
+    "2026-01-13", "2026-02-13", "2026-03-11", "2026-04-10", "2026-05-12", "2026-06-10",
+    "2026-07-14", "2026-08-12", "2026-09-11", "2026-10-14", "2026-11-10", "2026-12-10",
+]
+
+
+def _first_friday(year, month):
+    d = datetime.date(year, month, 1)
+    offset = (4 - d.weekday()) % 7  # Monday=0 ... Friday=4
+    return d + datetime.timedelta(days=offset)
+
+
+def get_upcoming_macro_events(days_ahead=14):
+    """近期可能大幅影响美联储利率预期、进而影响风险资产波动的重要事件：
+    CPI通胀数据(高影响) / FOMC利率决议(高影响) / 非农就业数据(中等影响)
+    非农是按"每月第一个周五"规则估算的，遇到节假日BLS可能顺延1天，仅供参考，
+    以官方公布为准；CPI和FOMC日期来自官方公开日程，相对准确"""
+    today = datetime.date.today()
+    horizon = today + datetime.timedelta(days=days_ahead)
+    events = []
+
+    for date_str in CPI_DATES_2026:
+        d = datetime.date.fromisoformat(date_str)
+        if today <= d <= horizon:
+            events.append({"date": d, "name": "美国CPI通胀数据公布", "importance": "high"})
+
+    for start, end in FOMC_MEETINGS_2026:
+        d = datetime.date.fromisoformat(end)
+        if today <= d <= horizon:
+            events.append({"date": d, "name": "美联储FOMC利率决议", "importance": "high"})
+
+    for m_offset in range(0, 2):
+        year = today.year + (today.month - 1 + m_offset) // 12
+        month = (today.month - 1 + m_offset) % 12 + 1
+        d = _first_friday(year, month)
+        if today <= d <= horizon:
+            events.append({"date": d, "name": "美国非农就业数据(NFP，日期为估算，节假日可能顺延1天)", "importance": "medium"})
+
+    events.sort(key=lambda e: e["date"])
+    for e in events:
+        e["days_until"] = (e["date"] - today).days
+    return events
+
+
+def get_macro_risk_advisory(caution_days=3):
+    """近期(caution_days天内)如果有高影响力事件，给一句"建议空仓观望"式的提醒
+    不代表一定会大跌大涨，只是提醒你这几天数据/决议公布前后波动通常会放大，
+    仓位控制和风险管理比平时更重要"""
+    events = get_upcoming_macro_events(days_ahead=14)
+    imminent = [e for e in events if e["importance"] == "high" and e["days_until"] <= caution_days]
+    return {"events": events, "imminent": imminent}
+
 
 # ========== 本地设置持久化：保存/读取你填入的Key、关注列表等 ==========
 # 保存在部署环境自己的文件系统里，不会上传到 GitHub（.gitignore 已排除）
@@ -741,8 +795,9 @@ def analyze_crypto_multi_timeframe(ticker):
 
     results = {}
     close_time_15m = None
+    closes_15m = None
     for key, interval, weight, cn_label in tf_config:
-        kl = fetch_binance_klines(ticker, interval, limit=300)
+        kl = fetch_binance_klines(ticker, interval, limit=200)
         if not kl or len(kl["closes"]) < 15:
             results[key] = None
             continue
@@ -754,6 +809,7 @@ def analyze_crypto_multi_timeframe(ticker):
                          "weight": weight, "cn_label": cn_label}
         if key == "15m":
             close_time_15m = kl["last_close_time_ms"]
+            closes_15m = kl["closes"]
 
     if not any(results.values()):
         return None
@@ -762,7 +818,7 @@ def analyze_crypto_multi_timeframe(ticker):
     macro_level = (results.get("1w") or results.get("1d") or {}).get("level", "neutral") if (results.get("1w") or results.get("1d")) else "neutral"
     macro_bias = "bullish" if macro_level in ("buy", "watch_buy") else ("bearish" if macro_level in ("sell", "watch_sell") else "neutral")
 
-    entry = find_entry_signal_15m(ticker, macro_bias) if macro_bias != "neutral" else None
+    entry = find_entry_signal_15m(closes_15m, macro_bias) if macro_bias != "neutral" else None
 
     return {
         "timeframes": results, "resonance": resonance, "macro_bias": macro_bias,
@@ -770,12 +826,11 @@ def analyze_crypto_multi_timeframe(ticker):
     }
 
 
-def find_entry_signal_15m(ticker, macro_bias):
-    """在15分钟周期上找"顺大势"的精准进场点，只在macro_bias方向上找，不逆势用15分钟单独判断"""
-    kl = fetch_binance_klines(ticker, "15m", limit=200)
-    if not kl or len(kl["closes"]) < 130:
+def find_entry_signal_15m(prices, macro_bias):
+    """在15分钟周期上找"顺大势"的精准进场点，只在macro_bias方向上找，不逆势用15分钟单独判断
+    prices 直接复用外层已经拉取过的15分钟收盘价，不再重复请求Binance"""
+    if not prices or len(prices) < 130:
         return None
-    prices = kl["closes"]
 
     rsi_now = compute_rsi(prices, 14)
     rsi_prev = compute_rsi(prices[:-1], 14)
@@ -802,10 +857,7 @@ def find_entry_signal_15m(ticker, macro_bias):
             reasons.append("15分钟MACD柱状图由正转负，短期动能转弱")
         action = "顺势减仓/止盈参考" if reasons else None
 
-    return {
-        "triggered": bool(reasons), "reasons": reasons, "action": action, "price": current,
-        "as_of_ms": kl["last_close_time_ms"],
-    }
+    return {"triggered": bool(reasons), "reasons": reasons, "action": action, "price": current}
 
 
 def analyze_forex_multi_timeframe(pair):
@@ -1036,6 +1088,14 @@ def generate_daily_report(watchlist_results, forex_results, new_coin_candidates,
         risk_signal = fed_overview.get("risk_signal")
         if risk_signal and risk_signal.get("available"):
             lines.append(f"**利率驱动的风险市场信号**：{risk_signal['trend']}，{risk_signal['bias']}")
+
+    macro = get_macro_risk_advisory(caution_days=3)
+    if macro["imminent"]:
+        names = "、".join(f"{e['name']}({e['days_until']}天后)" for e in macro["imminent"])
+        lines.append(f"\n**🚨 近期临近重要宏观事件，建议空仓观望**：{names}")
+    elif macro["events"]:
+        names = "、".join(f"{e['name']}({e['days_until']}天后)" for e in macro["events"][:3])
+        lines.append(f"\n**📅 近期重要宏观事件**：{names}")
 
     def group_by_bias(results):
         bullish = [r for r in results if not r.get("error") and r.get("level") in ("buy", "watch_buy")]
