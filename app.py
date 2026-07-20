@@ -265,6 +265,17 @@ with st.sidebar:
             st.error("保存失败（可能是部署环境没有写入权限），换个平台部署或者每次手动填一下")
     st.caption("⚠️ 保存在服务器本地文件里；如果你重新推送代码触发平台重新构建，需要重新保存一次")
 
+    st.divider()
+    with st.expander("🔧 诊断工具：测试交易所连接"):
+        st.caption("多周期共振/杠杆情绪查不到数据时，点这个按钮直接看真实报错，方便定位问题")
+        if st.button("开始测试", key="diag_btn"):
+            with st.spinner("正在测试..."):
+                diag_results = core.test_exchange_connectivity()
+            for d in diag_results:
+                icon = "✅" if d["ok"] else "❌"
+                st.markdown(f"{icon} **{d['name']}**　状态码: `{d['status']}`")
+                st.code(d["snippet"], language="text")
+
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
     ["👀 加密货币关注", "💱 外汇关注", "🚀 挖掘机会", "🐋 巨鲸监控", "📈 信号回测", "📰 每日报告"]
 )

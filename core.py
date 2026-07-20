@@ -767,6 +767,31 @@ def analyze_derivatives(ticker, change_24h=None):
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 
 
+def test_exchange_connectivity():
+    """诊断工具：直接测几个关键接口，把真实的HTTP状态码和返回内容显示出来，
+    帮你判断到底是网络连不上、被地域限制(常见是451)、还是别的问题"""
+    tests = [
+        ("Binance 现货K线", "https://api.binance.com/api/v3/klines",
+         {"symbol": "BTCUSDT", "interval": "1d", "limit": 5}),
+        ("Binance 合约资金费率", "https://fapi.binance.com/fapi/v1/premiumIndex", {"symbol": "BTCUSDT"}),
+        ("Bybit K线", "https://api.bybit.com/v5/market/kline",
+         {"category": "linear", "symbol": "BTCUSDT", "interval": "D", "limit": 5}),
+        ("Bybit 资金费率", "https://api.bybit.com/v5/market/funding/history",
+         {"category": "linear", "symbol": "BTCUSDT", "limit": 1}),
+    ]
+    results = []
+    for name, url, params in tests:
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+            results.append({
+                "name": name, "url": url, "status": resp.status_code,
+                "ok": resp.status_code == 200, "snippet": resp.text[:300],
+            })
+        except Exception as e:
+            results.append({"name": name, "url": url, "status": None, "ok": False, "snippet": f"请求异常: {e}"})
+    return results
+
+
 def fetch_bybit_klines(ticker, interval, limit=200):
     symbol = ticker.upper() + "USDT"
     bybit_interval = BYBIT_INTERVAL_MAP.get(interval)
