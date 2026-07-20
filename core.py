@@ -462,38 +462,41 @@ def compute_signal(prices, extra_rules=True):
     score = 0
     reasons = []
 
+    def add_reason(text, direction=0):
+        reasons.append({"text": text, "dir": direction})
+
     # RSI 水平
     if rsi is not None:
         if rsi < 30:
             score += 2
-            reasons.append(f"RSI(14)={rsi:.0f}，超卖区间")
+            add_reason(f"RSI(14)={rsi:.0f}，超卖区间", 1)
         elif rsi > 70:
             score -= 2
-            reasons.append(f"RSI(14)={rsi:.0f}，超买区间")
+            add_reason(f"RSI(14)={rsi:.0f}，超买区间", -1)
         else:
-            reasons.append(f"RSI(14)={rsi:.0f}，中性")
+            add_reason(f"RSI(14)={rsi:.0f}，中性", 0)
 
     # EMA20/60/120 多周期结构
     if ema20 is not None and ema60 is not None:
         if ema120 is not None:
             if current_price < ema120 and current_price > ema20 and ema20 > ema60:
                 score += 2
-                reasons.append("现价<EMA120但现价>EMA20>EMA60，趋势末期恢复迹象")
+                add_reason("现价<EMA120但现价>EMA20>EMA60，趋势末期恢复迹象", 1)
             elif current_price > ema120 and current_price > ema20 > ema60:
                 score += 1
-                reasons.append("现价>EMA20>EMA60>EMA120，多头排列")
+                add_reason("现价>EMA20>EMA60>EMA120，多头排列", 1)
             elif current_price < ema60 and ema20 < ema60:
                 score -= 2
-                reasons.append("现价<EMA60且EMA20<EMA60，趋势转弱")
+                add_reason("现价<EMA60且EMA20<EMA60，趋势转弱", -1)
             else:
-                reasons.append("EMA尚未形成明显多头或空头排列")
+                add_reason("EMA尚未形成明显多头或空头排列", 0)
         else:
             if current_price > ema20 > ema60:
                 score += 1
-                reasons.append("现价>EMA20>EMA60，短中期偏多")
+                add_reason("现价>EMA20>EMA60，短中期偏多", 1)
             elif current_price < ema20 < ema60:
                 score -= 1
-                reasons.append("现价<EMA20<EMA60，短中期偏空")
+                add_reason("现价<EMA20<EMA60，短中期偏空", -1)
 
     # SMA20 vs EMA20：判断近期动能是在加速还是减速
     # EMA对近期价格更敏感，EMA20明显高于SMA20说明最近涨得比前段时间更猛（加速）
@@ -501,39 +504,39 @@ def compute_signal(prices, extra_rules=True):
         gap_pct = (ema20 - sma20) / sma20 * 100
         if gap_pct > 0.3:
             score += 1
-            reasons.append(f"EMA20高于SMA20 {gap_pct:.1f}%，近期上涨动能在加速")
+            add_reason(f"EMA20高于SMA20 {gap_pct:.1f}%，近期上涨动能在加速", 1)
         elif gap_pct < -0.3:
             score -= 1
-            reasons.append(f"EMA20低于SMA20 {abs(gap_pct):.1f}%，近期下跌动能在加速")
+            add_reason(f"EMA20低于SMA20 {abs(gap_pct):.1f}%，近期下跌动能在加速", -1)
 
     # MACD 柱状图转折
     if macd is not None:
         if macd["prev_hist"] <= 0 < macd["hist"]:
             score += 1
-            reasons.append("MACD柱状图由负转正，动能转强")
+            add_reason("MACD柱状图由负转正，动能转强", 1)
         elif macd["prev_hist"] >= 0 > macd["hist"]:
             score -= 1
-            reasons.append("MACD柱状图由正转负，动能转弱")
+            add_reason("MACD柱状图由正转负，动能转弱", -1)
         elif macd["hist"] > 0 and macd["hist"] < macd["prev_hist"]:
-            reasons.append("MACD柱状图仍为正但在缩小，上涨动能减弱")
+            add_reason("MACD柱状图仍为正但在缩小，上涨动能减弱", 0)
         elif macd["hist"] < 0 and macd["hist"] > macd["prev_hist"]:
-            reasons.append("MACD柱状图仍为负但在收窄，下跌动能减弱")
+            add_reason("MACD柱状图仍为负但在收窄，下跌动能减弱", 0)
 
     # RSI 背离
     if divergence == "bullish":
         score += 2
-        reasons.append("价格创近期新低但RSI未跟随创新低，底背离信号")
+        add_reason("价格创近期新低但RSI未跟随创新低，底背离信号", 1)
     elif divergence == "bearish":
         score -= 2
-        reasons.append("价格创近期新高但RSI未跟随创新高，顶背离信号")
+        add_reason("价格创近期新高但RSI未跟随创新高，顶背离信号", -1)
 
     if extra_rules:
         if change_24h >= 15:
             score -= 1
-            reasons.append(f"24h涨{change_24h:+.0f}%，追高风险上升")
+            add_reason(f"24h涨{change_24h:+.0f}%，追高风险上升", -1)
         if change_7d is not None and change_7d <= -20 and rsi is not None and rsi < 40:
             score += 1
-            reasons.append(f"7d跌{change_7d:+.0f}%且RSI偏低，或超跌企稳")
+            add_reason(f"7d跌{change_7d:+.0f}%且RSI偏低，或超跌企稳", 1)
 
     if score >= 5:
         label, level = "🟢 关注买入区", "buy"
@@ -816,7 +819,7 @@ def analyze_forex_multi_timeframe(pair):
     return {"timeframes": results, "resonance": resonance}
 
 
-def analyze_coin(raw_query, cg_api_key=None, include_derivatives=True):
+def analyze_coin(raw_query, cg_api_key=None, include_derivatives=True, include_resonance=True):
     """综合价格、24h/7d涨跌、RSI、EMA、MACD、背离，给出一个状态提示 + 理由列表
     这是基于常见技术指标的规则打分，不是预测，仅作为你自己判断时的参考"""
     coin_id, err = resolve_coin_id(raw_query, cg_api_key)
@@ -830,24 +833,32 @@ def analyze_coin(raw_query, cg_api_key=None, include_derivatives=True):
 
     sig["coin"] = coin_id
     sig["query"] = raw_query
+    sig["display"] = raw_query.strip().upper()  # 显示用你输入的简写，而不是CoinGecko的全称id
+
+    ticker = guess_exchange_ticker(coin_id, raw_query)
 
     sig["derivatives"] = None
-    if include_derivatives:
-        ticker = guess_exchange_ticker(coin_id, raw_query)
-        if ticker:
-            try:
-                sig["derivatives"] = analyze_derivatives(ticker, sig.get("change_24h"))
-            except Exception:
-                sig["derivatives"] = None
+    if include_derivatives and ticker:
+        try:
+            sig["derivatives"] = analyze_derivatives(ticker, sig.get("change_24h"))
+        except Exception:
+            sig["derivatives"] = None
+
+    sig["resonance_data"] = None
+    if include_resonance and ticker:
+        try:
+            sig["resonance_data"] = analyze_crypto_multi_timeframe(ticker)
+        except Exception:
+            sig["resonance_data"] = None
 
     return sig
 
 
-def analyze_watchlist(coin_ids, include_whale=False, cg_api_key=None, include_derivatives=True):
+def analyze_watchlist(coin_ids, include_whale=False, cg_api_key=None, include_derivatives=True, include_resonance=True):
     results = []
     for coin_id in coin_ids:
         try:
-            r = analyze_coin(coin_id, cg_api_key, include_derivatives=include_derivatives)
+            r = analyze_coin(coin_id, cg_api_key, include_derivatives=include_derivatives, include_resonance=include_resonance)
             if include_whale and "error" not in r:
                 r["whale"] = get_watchlist_whale_info(r["coin"], cg_api_key)
         except Exception as e:
@@ -873,7 +884,7 @@ def fetch_forex_history(pair, days=100):
     return [rates[d][quote] for d in sorted_dates if quote in rates[d]]
 
 
-def analyze_forex_pair(pair):
+def analyze_forex_pair(pair, include_resonance=True):
     """外汇版的状态打分，跟加密货币共用同一套 RSI/均线打分逻辑
     （extra_rules=False，因为"24h暴涨追高"这类规则是为加密货币的高波动设计的，
     外汇日内波动通常远小于1%，套用同样阈值基本不会触发，意义不大）"""
@@ -887,14 +898,23 @@ def analyze_forex_pair(pair):
         return {"coin": pair, "error": "历史数据不足（可能是货币代码写错，或者ECB不覆盖这个货币）"}
 
     sig["coin"] = pair.upper()
+    sig["display"] = pair.strip().upper()
+
+    sig["resonance_data"] = None
+    if include_resonance:
+        try:
+            sig["resonance_data"] = analyze_forex_multi_timeframe(pair)
+        except Exception:
+            sig["resonance_data"] = None
+
     return sig
 
 
-def analyze_forex_watchlist(pairs):
+def analyze_forex_watchlist(pairs, include_resonance=True):
     results = []
     for pair in pairs:
         try:
-            results.append(analyze_forex_pair(pair))
+            results.append(analyze_forex_pair(pair, include_resonance=include_resonance))
         except Exception as e:
             results.append({"coin": pair, "error": f"获取数据失败: {e}"})
         time.sleep(0.2)

@@ -19,50 +19,76 @@ LEVEL_COLOR = {
 saved = core.load_user_config()
 
 
-def render_watchlist_row(r, show_whale=False):
+def render_reason_list(reasons):
+    """reasons: [{"text":..., "dir": 1/-1/0}, ...]，一行一个编号，
+    对打分有实际影响的理由(dir!=0)加粗变色，方便你优先看重点"""
+    for i, item in enumerate(reasons, 1):
+        text, direction = item["text"], item["dir"]
+        if direction == 1:
+            st.markdown(f"{i}. **:green[{text}]**")
+        elif direction == -1:
+            st.markdown(f"{i}. **:red[{text}]**")
+        else:
+            st.write(f"{i}. {text}")
+
+
+def render_watchlist_row(r, show_whale=False, is_crypto=True):
+    display_name = r.get("display", r.get("query", r.get("coin", "?")))
     if "error" in r:
-        st.warning(f"**{r.get('query', r['coin'])}**：{r['error']}")
+        st.warning(f"**{display_name}**：{r['error']}")
         return
 
-    reason_line = "　".join(r["reasons"])
-    change7 = f"7d {r['change_7d']:+.1f}%" if r.get("change_7d") is not None else ""
+    change7 = f"　7d {r['change_7d']:+.1f}%" if r.get("change_7d") is not None else ""
 
-    whale_line = ""
-    if show_whale:
-        if r.get("whale"):
-            w = r["whale"]
-            if w.get("top10_pct") is not None:
-                whale_line = f"　🐋前10持仓占比 {w['top10_pct']:.1f}%（持有人数 {w.get('holder_count', '—')}）"
-        else:
-            whale_line = "　🐋该链暂不支持集中度检测"
+    with st.container(border=True):
+        st.markdown(
+            f"### {display_name}　`{r['price']:,.4f}`　"
+            f"24h {r['change_24h']:+.1f}%{change7}　:{LEVEL_COLOR.get(r['level'],'gray')}[{r['label']}]"
+        )
 
-    st.markdown(
-        f"**{r['coin'].upper()}**　`{r['price']:,.4f}`　"
-        f"24h {r['change_24h']:+.1f}%　{change7}　:{LEVEL_COLOR.get(r['level'],'gray')}[{r['label']}]"
-    )
-    st.caption(f"技术面理由：{reason_line}{whale_line}")
+        st.markdown("**技术面理由：**")
+        render_reason_list(r["reasons"])
 
-    deriv = r.get("derivatives")
-    if deriv:
-        bias_icon = {"overheat": "⚠️", "washout": "💡", "risk": "🟠", "neutral": "⚪"}.get(deriv["bias"], "")
-        st.caption(f"{bias_icon} 杠杆情绪：{'　'.join(deriv['reasons'])}")
+        if show_whale:
+            if r.get("whale"):
+                w = r["whale"]
+                if w.get("top10_pct") is not None:
+                    st.write(f"🐋 前10持仓占比 {w['top10_pct']:.1f}%（持有人数 {w.get('holder_count', '—')}）")
+            else:
+                st.caption("🐋 该链暂不支持集中度检测")
 
-    st.divider()
+        deriv = r.get("derivatives")
+        if deriv:
+            bias_icon = {"overheat": "⚠️", "washout": "💡", "risk": "🟠", "neutral": "⚪"}.get(deriv["bias"], "")
+            st.markdown(f"**{bias_icon} 杠杆情绪：**")
+            for i, text in enumerate(deriv["reasons"], 1):
+                if deriv["bias"] in ("overheat",):
+                    st.markdown(f"{i}. **:red[{text}]**")
+                elif deriv["bias"] in ("washout",):
+                    st.markdown(f"{i}. **:green[{text}]**")
+                else:
+                    st.write(f"{i}. {text}")
+
+        mtf = r.get("resonance_data")
+        if mtf:
+            st.markdown("**📊 多周期共振：**")
+            render_resonance_panel(mtf, is_crypto=is_crypto, compact=True)
 
 
-def render_resonance_panel(mtf_data, is_crypto=True):
+def render_resonance_panel(mtf_data, is_crypto=True, compact=False):
     resonance = mtf_data["resonance"]
     strength = resonance["strength"]
 
     # 用Streamlit自带的彩色提示框做强弱区分：共振信号越强、颜色越醒目，避免你漏看重要结论
+    heading = resonance["desc"] if compact else f"#### {resonance['desc']}"
     if strength == "strong_bull":
-        st.success(f"#### {resonance['desc']}")
+        st.success(heading)
     elif strength == "strong_bear":
-        st.error(f"#### {resonance['desc']}")
+        st.error(heading)
     elif strength in ("lean_bull", "lean_bear"):
-        st.warning(resonance["desc"])
+        st.warning(heading)
     else:
-        st.info(resonance["desc"])
+        st.info(heading)
 
     tf_items = list(mtf_data["timeframes"].items())
     cols = st.columns(len(tf_items))
@@ -80,8 +106,8 @@ def render_resonance_panel(mtf_data, is_crypto=True):
         entry = mtf_data["entry"]
         if entry["triggered"]:
             st.success(f"🎯 **{entry['action']}**")
-            for reason in entry["reasons"]:
-                st.write(f"• {reason}")
+            for i, reason in enumerate(entry["reasons"], 1):
+                st.markdown(f"{i}. **{reason}**")
         else:
             st.caption("15分钟周期暂未出现明确的顺势信号，建议继续观察，不要单独用15分钟逆势判断")
 
@@ -90,11 +116,12 @@ def render_resonance_panel(mtf_data, is_crypto=True):
             now = datetime.datetime.now(datetime.timezone.utc)
             mins_ago = int((now - close_dt).total_seconds() / 60)
             if mins_ago > 15:
-                st.warning(f"⏱️ 这个15分钟信号截至 {mins_ago} 分钟前，已经过了一根K线的时间，建议重新点一次分析")
+                st.warning(f"⏱️ 这个15分钟信号截至 {mins_ago} 分钟前，已经过了一根K线的时间，建议刷新")
             else:
                 st.caption(f"⏱️ 15分钟信号截至 {mins_ago} 分钟前")
 
-    st.caption("⚠️ 多周期共振是「多个独立视角是否一致」的参考框架，不是预测；15分钟信号只在大周期方向上找顺势进场时机，不建议单独逆势使用")
+    if not compact:
+        st.caption("⚠️ 多周期共振是「多个独立视角是否一致」的参考框架，不是预测；15分钟信号只在大周期方向上找顺势进场时机，不建议单独逆势使用")
 
 
 # ---------- 顶部：市场概览 ----------
@@ -164,6 +191,8 @@ with st.sidebar:
                                         help="仅覆盖以太坊/BSC/Base/Arbitrum/Polygon 上的代币")
     show_derivatives = st.checkbox("同时查杠杆情绪(资金费率+未平仓合约)", value=saved.get("show_derivatives", True),
                                     help="数据源Binance合约，免费不需要key；只覆盖有合约上架的币种，小市值新币可能没有")
+    show_resonance = st.checkbox("同时查多周期共振(15m/1h/1d/1w，外汇为日/周/月)", value=saved.get("show_resonance", True),
+                                  help="会给每个关注币种/货币对多打好几个请求，watchlist较多时会明显变慢，慢的话可以关掉")
 
     st.divider()
     st.subheader("💱 关注外汇货币对")
@@ -208,6 +237,7 @@ with st.sidebar:
             "cg_key": cg_key,
             "watchlist_text": watchlist_text, "forex_text": forex_text,
             "show_whale_watchlist": show_whale_watchlist, "show_derivatives": show_derivatives,
+            "show_resonance": show_resonance,
             "min_liquidity": min_liquidity, "min_volume": min_volume, "min_change_1h": min_change_1h,
             "chains": chains, "run_security_check": run_security_check, "run_background": run_background,
             "etherscan_key": etherscan_key, "wallets_text": wallets_text, "fred_key": fred_key,
@@ -224,85 +254,49 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
 
 # ---------- Tab 1: 加密货币关注 ----------
 with tab1:
-    st.caption("基于 RSI、EMA20/60/120多周期结构、SMA20动能、MACD、RSI背离 做多因子技术面打分，加上Binance合约的杠杆情绪，仅供参考，不构成投资建议")
+    st.caption("基于 RSI、EMA20/60/120多周期结构、SMA20动能、MACD、RSI背离 做多因子技术面打分，加上Binance合约的杠杆情绪和多周期共振，仅供参考，不构成投资建议")
 
     if st.button("🔄 刷新分析", key="refresh_watchlist"):
         st.cache_data.clear()
 
     @st.cache_data(ttl=120)
-    def get_watchlist_analysis(coin_ids, include_whale, cg_key_, include_deriv):
+    def get_watchlist_analysis(coin_ids, include_whale, cg_key_, include_deriv, include_reso):
         return core.analyze_watchlist(coin_ids, include_whale=include_whale, cg_api_key=cg_key_,
-                                       include_derivatives=include_deriv)
+                                       include_derivatives=include_deriv, include_resonance=include_reso)
 
     if not watchlist:
         st.info("请在左侧输入你想关注的币种")
         watchlist_results = []
     else:
-        with st.spinner("正在获取数据并计算指标..."):
-            watchlist_results = get_watchlist_analysis(tuple(watchlist), show_whale_watchlist, cg_key, show_derivatives)
+        with st.spinner("正在获取数据并计算指标（含多周期共振会比较慢，请耐心等）..."):
+            watchlist_results = get_watchlist_analysis(
+                tuple(watchlist), show_whale_watchlist, cg_key, show_derivatives, show_resonance
+            )
         for r in watchlist_results:
-            render_watchlist_row(r, show_whale=show_whale_watchlist)
-
-    st.divider()
-    st.subheader("🔎 多周期共振分析（15分钟/1小时/日线/周线）")
-    st.caption(
-        "数据源Binance现货K线，免费；只针对你输入的单个币种做深度分析，不会对整个关注列表批量跑（避免请求过多）。"
-        "大周期(周线)定方向、小周期(15分钟)找顺势进场时机"
-    )
-    mc1, mc2 = st.columns([3, 1])
-    mtf_ticker = mc1.text_input("要分析的币种代号", value="BTC", key="mtf_crypto_ticker")
-    if mc2.button("开始分析", key="mtf_crypto_btn", type="primary"):
-        with st.spinner("正在拉取周线/日线/小时线/15分钟线数据..."):
-            st.session_state["mtf_crypto_result"] = core.analyze_crypto_multi_timeframe(mtf_ticker)
-
-    if "mtf_crypto_result" in st.session_state:
-        mtf_result = st.session_state["mtf_crypto_result"]
-        if mtf_result:
-            render_resonance_panel(mtf_result, is_crypto=True)
-        else:
-            st.warning("没有拉到这个币种的K线数据，可能是Binance没有对应的USDT交易对，换个主流一点的代号试试")
+            render_watchlist_row(r, show_whale=show_whale_watchlist, is_crypto=True)
 
 
 # ---------- Tab 2: 外汇关注 ----------
 with tab2:
     st.caption(
-        "数据源：欧洲央行(ECB)每日参考汇率，只有工作日数据；同样基于 RSI/均线打分，仅供参考"
+        "数据源：欧洲央行(ECB)每日参考汇率，只有工作日数据；同样基于 RSI/均线打分+多周期共振，仅供参考"
     )
 
     if st.button("🔄 刷新分析", key="refresh_forex"):
         st.cache_data.clear()
 
     @st.cache_data(ttl=300)
-    def get_forex_analysis(pairs):
-        return core.analyze_forex_watchlist(pairs)
+    def get_forex_analysis(pairs, include_reso):
+        return core.analyze_forex_watchlist(pairs, include_resonance=include_reso)
 
     if not forex_watchlist:
         st.info("请在左侧输入你想关注的货币对")
         forex_results = []
     else:
         with st.spinner("正在获取汇率数据并计算指标..."):
-            forex_results = get_forex_analysis(tuple(forex_watchlist))
+            forex_results = get_forex_analysis(tuple(forex_watchlist), show_resonance)
         for r in forex_results:
-            render_watchlist_row(r, show_whale=False)
-
-    st.divider()
-    st.subheader("🔎 多周期共振分析（日/周/月）")
-    st.caption(
-        "外汇没有免费的分钟级数据，周线和月线是从日线数据自己聚合出来的，不需要额外调用接口。"
-        "大周期(月线)定方向、小周期(日线)辅助判断"
-    )
-    fc1, fc2 = st.columns([3, 1])
-    mtf_pair = fc1.text_input("要分析的货币对", value="USD/JPY", key="mtf_forex_pair")
-    if fc2.button("开始分析", key="mtf_forex_btn", type="primary"):
-        with st.spinner("正在获取并聚合日/周/月数据..."):
-            st.session_state["mtf_forex_result"] = core.analyze_forex_multi_timeframe(mtf_pair)
-
-    if "mtf_forex_result" in st.session_state:
-        mtf_forex_result = st.session_state["mtf_forex_result"]
-        if mtf_forex_result:
-            render_resonance_panel(mtf_forex_result, is_crypto=False)
-        else:
-            st.warning("没有拉到这个货币对的数据，检查一下格式是不是 美元/日元 这种写法，比如 USD/JPY")
+            render_watchlist_row(r, show_whale=False, is_crypto=False)
 
 
 # ---------- Tab 3: 挖掘机会（新币早期 / 二级市场强势 / 一级市场融资） ----------
