@@ -31,6 +31,22 @@ GOPLUS_CHAIN_MAP = {
     "polygon": "137",
 }
 
+# 巨鲸监控里你手动填的链名，容错处理常见的大小写/别名写法，统一转换成上面这几个标准key
+CHAIN_ALIASES = {
+    "eth": "ethereum", "ethereum": "ethereum", "ether": "ethereum", "以太坊": "ethereum",
+    "bsc": "bsc", "bnb": "bsc", "binance": "bsc", "bnbchain": "bsc", "bnb chain": "bsc", "币安智能链": "bsc",
+    "base": "base",
+    "arbitrum": "arbitrum", "arb": "arbitrum",
+    "polygon": "polygon", "matic": "polygon", "pol": "polygon",
+}
+
+
+def normalize_chain_name(chain):
+    """把你手动输入的链名（不管大小写、常见别名）统一转换成标准key，
+    转换不了的原样返回小写形式，交给后面的判断逻辑处理"""
+    key = (chain or "").strip().lower()
+    return CHAIN_ALIASES.get(key, key)
+
 # CoinGecko 的 platform 字段命名 -> 我们统一使用的链名
 CG_PLATFORM_MAP = {
     "ethereum": "ethereum",
@@ -1364,7 +1380,7 @@ def fetch_wallet_activity(chain, address, api_key, limit=30):
     """拉取这个地址最近的 ERC20 代币转账记录（进/出），作为"巨鲸最近在做什么"的活动流水"""
     chain_id = GOPLUS_CHAIN_MAP.get(chain)
     if not chain_id:
-        return None, "该链暂不支持（目前仅支持以太坊/BSC/Base/Arbitrum/Polygon等EVM链）"
+        return None, "该链暂不支持（目前仅支持 ethereum/bsc/base/arbitrum/polygon 这几条EVM链，Solana、比特币等非EVM链暂时做不了）"
     if not api_key:
         return None, "需要先在左侧填入你自己的免费 Etherscan API Key"
 
@@ -1504,7 +1520,7 @@ def monitor_whale_wallets(wallets, api_key):
     给每个地址生成一份"今天做了什么"的报告"""
     results = []
     for w in wallets:
-        chain, address, label = w["chain"], w["address"], w.get("label", "")
+        chain, address, label = normalize_chain_name(w["chain"]), w["address"], w.get("label", "")
         balance = fetch_wallet_balance(chain, address, api_key)
         report = build_whale_daily_report(chain, address, api_key, label)
         report["native_balance"] = balance
