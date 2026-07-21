@@ -52,6 +52,20 @@ def normalize_chain_name(chain):
     key = (chain or "").strip().lower()
     return CHAIN_ALIASES.get(key, key)
 
+
+# 知名做市商/机构地址预设，方便你一键添加到巨鲸监控列表，不用自己去找地址
+# 【可信度说明】：Wintermute地址是你自己提供的；Jump Trading的两个地址来自Etherscan官方
+# 公开标签（Etherscan Name Tags，相对可信但仍是第三方标注，不是100%官方认证）；
+# 没有找到能确认的Cumberland具体地址，所以没有收录，建议你自己去Etherscan/Arkham核实后手动添加
+PRESET_INSTITUTION_ADDRESSES = [
+    {"label": "Wintermute", "chain": "ethereum", "address": "0xdbf5e9c520de273fc5996963770d460b31efbf16",
+     "source": "用户提供"},
+    {"label": "Jump Trading", "chain": "ethereum", "address": "0xf584f8728b874a6a5c7a8d4d387c9aae9172d621",
+     "source": "Etherscan公开标签"},
+    {"label": "Jump Trading 2", "chain": "ethereum", "address": "0x9507c04b10486547584c37bcbd931b2a4fee9a41",
+     "source": "Etherscan公开标签"},
+]
+
 # CoinGecko 的 platform 字段命名 -> 我们统一使用的链名
 CG_PLATFORM_MAP = {
     "ethereum": "ethereum",
@@ -1560,9 +1574,49 @@ def fetch_wallet_activity(chain, address, api_key, limit=30):
             "counterparty": tx.get("from") if is_in else tx.get("to"),
             "hash": tx.get("hash"),
             "chain": chain,
+            "contract": tx.get("contractAddress", ""),
         })
 
     return results, None
+
+
+# ========== 垃圾空投代币过滤 ==========
+# 公开地址（尤其是名人、机构地址）每天会收到大量恶意空投的仿冒代币（假USDT、钓鱼链接
+# 伪装成代币名称等），这些噪音会把真正有意义的转账记录淹没，需要先过滤掉
+
+SAFE_TOKEN_SYMBOLS = {
+    "eth", "weth", "btc", "wbtc", "usdt", "usdc", "dai", "bnb", "wbnb", "matic",
+    "sol", "arb", "op", "avax", "link", "uni", "aave", "mkr", "ldo", "pepe", "shib",
+}
+
+SPAM_TEXT_PATTERNS = [".com", ".io", ".net", ".xyz", ".org", "http", "www.", "claim", "visit", "airdrop", "reward", "$"]
+
+
+def is_likely_spam_token(symbol, chain=None, contract=None):
+    """判断一笔转账收到的代币是不是垃圾空投。两层过滤：
+    1. 文本模式：仿冒代币的symbol经常带链接/诱导性文字（比如"Visit xxx.com to claim"），零成本，先过滤一遍
+    2. 流动性检测：不在常见主流币白名单里的代币，去DexScreener查一下有没有真实交易对，
+       完全查不到流动性的，大概率是空气/仿冒代币（这一步会消耗一次请求，只对陌生代币做）
+    """
+    sym = (symbol or "").strip().lower()
+    if not sym:
+        return True
+    if sym in SAFE_TOKEN_SYMBOLS:
+        return False
+    if any(p in sym for p in SPAM_TEXT_PATTERNS):
+        return True
+    if len(symbol) > 20:  # 正常代号很少超过20个字符，经常是塞了一整句宣传语
+        return True
+
+    if chain and contract:
+        try:
+            pair = get_pair_data(chain, contract)
+            if not pair or not (pair.get("liquidity") or {}).get("usd"):
+                return True
+        except Exception:
+            pass  # 查询失败不算它是垃圾，避免误杀
+
+    return False
 
 
 def get_address_type(chain, address, api_key):
@@ -1597,22 +1651,43 @@ def get_address_type(chain, address, api_key):
     return {"is_contract": is_contract, "name": name}
 
 
-def build_whale_daily_report(chain, address, api_key, label=""):
+DEX_ROUTER_KEYWORDS = ("router", "swap", "aggregator", "1inch", "uniswap", "sushiswap",
+                       "paraswap", "curve", "balancer", "kyber", "zeroex", "0x")
+
+
+def build_whale_daily_report(chain, address, api_key, label="", known_addresses=None):
     """给某个巨鲸地址出一份"今天做了什么"的报告：
-    1. 按代币聚合今天的净流入/净流出（这是客观算出来的事实）
-    2. 查一下今天主要交易对手方是合约还是普通钱包、合约叫什么名字（客观查到的事实）
-    3. 基于以上两点给几条解读思路（明确框定为"可能性/建议核实方向"，不是确定结论——
+    1. 先过滤掉垃圾空投代币（仿冒币/无流动性代币），避免噪音淹没有意义的记录
+    2. 按代币聚合今天的净流入/净流出（这是客观算出来的事实）
+    3. 查一下今天主要交易对手方是合约还是普通钱包、合约叫什么名字（客观查到的事实）；
+       如果对手方命中你自己维护的"已知交易所/机构地址库"，直接用你标记的名字，
+       并结合转账方向判断"疑似充值到交易所"还是"疑似从交易所提现"
+    4. 基于以上给几条解读思路（明确框定为"可能性/建议核实方向"，不是确定结论——
        链上数据本身不包含"意图"，任何"背后深意"的判断都需要你结合交易hash自行核实）
     """
-    activity, error = fetch_wallet_activity(chain, address, api_key, limit=100)
+    known_addresses = known_addresses or {}
+    activity, error = fetch_wallet_activity(chain, address, api_key, limit=150)
     if error:
         return {"label": label, "address": address, "chain": chain, "error": error}
 
     today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
-    today_txs = [tx for tx in activity if tx["time"].startswith(today)]
+    today_txs_raw = [tx for tx in activity if tx["time"].startswith(today)]
+
+    if not today_txs_raw:
+        return {"label": label, "address": address, "chain": chain, "has_activity": False, "date": today}
+
+    today_txs, spam_count = [], 0
+    for tx in today_txs_raw:
+        if is_likely_spam_token(tx["symbol"], tx.get("chain"), tx.get("contract")):
+            spam_count += 1
+            continue
+        today_txs.append(tx)
 
     if not today_txs:
-        return {"label": label, "address": address, "chain": chain, "has_activity": False, "date": today}
+        return {
+            "label": label, "address": address, "chain": chain, "has_activity": False,
+            "date": today, "spam_filtered": spam_count,
+        }
 
     token_flows = {}
     counterparties = {}
@@ -1624,22 +1699,40 @@ def build_whale_daily_report(chain, address, api_key, label=""):
         flow["in_count" if tx["direction"] == "转入" else "out_count"] += 1
         counterparties.setdefault(tx["counterparty"], []).append(tx)
 
+    known_lower = {k.lower(): v for k, v in known_addresses.items()}
+
     # 只查交易笔数最多的前5个对手方的地址类型，避免请求太多超出免费额度
     top_counterparties = sorted(counterparties.items(), key=lambda kv: len(kv[1]), reverse=True)[:5]
     hypothesis = []
     for cp_addr, txs in top_counterparties:
-        info = get_address_type(chain, cp_addr, api_key)
-        time.sleep(0.2)
         n_tx = len(txs)
         short_addr = f"{cp_addr[:10]}...{cp_addr[-6:]}"
+        directions = {t["direction"] for t in txs}
+
+        known_label = known_lower.get(cp_addr.lower())
+        if known_label:
+            if directions == {"转出"}:
+                note = f"今天{n_tx}笔转出到你标记的「{known_label}」，如果这是交易所地址，可能是充值准备卖出/操作"
+            elif directions == {"转入"}:
+                note = f"今天{n_tx}笔从你标记的「{known_label}」转入，如果这是交易所地址，可能是提现（囤币倾向）"
+            else:
+                note = f"今天跟你标记的「{known_label}」发生了{n_tx}笔往返转账"
+            hypothesis.append({"counterparty": cp_addr, "short": short_addr, "tx_count": n_tx,
+                                "type": "已知地址", "note": note})
+            continue
+
+        info = get_address_type(chain, cp_addr, api_key)
+        time.sleep(0.2)
         if info.get("is_contract"):
             name = info.get("name") or "未在Etherscan验证的合约"
-            hypothesis.append({
-                "counterparty": cp_addr, "short": short_addr, "tx_count": n_tx, "type": "合约",
-                "note": f"对手方是合约「{name}」，发生了{n_tx}笔交易。如果这是DEX路由/聚合器类合约，"
-                        f"可能是在做链上swap（换币）；具体换成了什么、金额是否对等，建议点交易hash到"
-                        f"区块浏览器看完整的调用记录再判断",
-            })
+            if any(kw in name.lower() for kw in DEX_ROUTER_KEYWORDS):
+                note = (f"对手方是「{name}」，从名字看疑似DEX路由/聚合器合约，发生了{n_tx}笔交易，"
+                        f"大概率是在做链上swap（换币）；具体换成了什么、金额是否对等，建议点交易hash核实")
+            else:
+                note = (f"对手方是合约「{name}」，发生了{n_tx}笔交易，具体是什么操作建议点交易hash"
+                        f"到区块浏览器核实调用的方法")
+            hypothesis.append({"counterparty": cp_addr, "short": short_addr, "tx_count": n_tx,
+                                "type": "合约", "note": note})
         elif info.get("is_contract") is False:
             hypothesis.append({
                 "counterparty": cp_addr, "short": short_addr, "tx_count": n_tx, "type": "普通钱包",
@@ -1655,18 +1748,20 @@ def build_whale_daily_report(chain, address, api_key, label=""):
     return {
         "label": label, "address": address, "chain": chain, "has_activity": True,
         "date": today, "tx_count": len(today_txs), "token_flows": token_flows,
-        "hypothesis": hypothesis, "raw_txs": today_txs,
+        "hypothesis": hypothesis, "raw_txs": today_txs, "spam_filtered": spam_count,
     }
 
 
-def monitor_whale_wallets(wallets, api_key):
+def monitor_whale_wallets(wallets, api_key, known_addresses=None):
     """wallets: [{"chain": "ethereum", "address": "0x...", "label": "自定义备注名"}]
+    known_addresses: {"0x...": "Binance 14"} 这类你自己维护的已知交易所/机构地址库，
+    用于识别转账对手方，不是我们瞎猜的
     给每个地址生成一份"今天做了什么"的报告"""
     results = []
     for w in wallets:
         chain, address, label = normalize_chain_name(w["chain"]), w["address"], w.get("label", "")
         balance = fetch_wallet_balance(chain, address, api_key)
-        report = build_whale_daily_report(chain, address, api_key, label)
+        report = build_whale_daily_report(chain, address, api_key, label, known_addresses=known_addresses)
         report["native_balance"] = balance
         results.append(report)
         time.sleep(0.3)

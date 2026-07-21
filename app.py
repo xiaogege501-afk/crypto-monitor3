@@ -237,10 +237,33 @@ with st.sidebar:
     st.subheader("🐋 巨鲸钱包监控")
     st.caption("需要免费的 Etherscan API Key：etherscan.io/myapikey")
     etherscan_key = st.text_input("Etherscan API Key", value=saved.get("etherscan_key", ""), type="password")
+
+    with st.expander("💼 快速添加：知名做市商/机构地址"):
+        st.caption(
+            "Wintermute地址是你提供的；Jump Trading两个地址来自Etherscan公开标签（第三方标注，"
+            "不是100%官方认证）；没找到能确认的Cumberland具体地址，建议自己去Etherscan/Arkham核实后手动添加"
+        )
+        preset_picked = st.multiselect(
+            "勾选要添加的地址", [p["label"] for p in core.PRESET_INSTITUTION_ADDRESSES], key="preset_picker"
+        )
+
     st.caption("每行一个：链,地址,备注（备注可省略）")
+    default_wallets = saved.get("wallets_text", "")
+    if preset_picked:
+        preset_lines = [f"{p['chain']},{p['address']},{p['label']}"
+                         for p in core.PRESET_INSTITUTION_ADDRESSES if p["label"] in preset_picked]
+        existing_lines = [line for line in default_wallets.splitlines() if line.strip()]
+        default_wallets = "\n".join(existing_lines + [l for l in preset_lines if l not in existing_lines])
     wallets_text = st.text_area(
-        "监控地址", value=saved.get("wallets_text", ""), height=100, label_visibility="collapsed",
+        "监控地址", value=default_wallets, height=100, label_visibility="collapsed",
         placeholder="ethereum,0xAbC...,某巨鲸"
+    )
+
+    st.caption("已知交易所/机构地址库（可选）：每行一个，格式 地址,标签。用来识别转账对手方，"
+               "地址需要你自己从Etherscan/Arkham这类公开信息核实，不是我们帮你猜的")
+    known_addresses_text = st.text_area(
+        "已知地址库", value=saved.get("known_addresses_text", ""), height=80, label_visibility="collapsed",
+        placeholder="0x28c6c06298d514db089934071355e5743bf21d60,Binance 14"
     )
 
     st.divider()
@@ -258,6 +281,7 @@ with st.sidebar:
             "min_liquidity": min_liquidity, "min_volume": min_volume, "min_change_1h": min_change_1h,
             "chains": chains, "run_security_check": run_security_check, "run_background": run_background,
             "etherscan_key": etherscan_key, "wallets_text": wallets_text, "fred_key": fred_key,
+            "known_addresses_text": known_addresses_text,
         }
         if core.save_user_config(cfg):
             st.success("已保存，下次打开会自动填充")
@@ -476,22 +500,30 @@ with tab4:
         if len(parts) >= 2 and parts[0] and parts[1]:
             wallets.append({"chain": parts[0], "address": parts[1], "label": parts[2] if len(parts) > 2 else ""})
 
+    known_addresses = {}
+    for line in known_addresses_text.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 2 and parts[0] and parts[1]:
+            known_addresses[parts[0]] = parts[1]
+
     if not etherscan_key:
         st.info("请在左侧填入你自己的免费 Etherscan API Key（etherscan.io/myapikey 几分钟就能申请到）")
     elif not wallets:
-        st.info("请在左侧按 `链,地址,备注` 的格式，添加你想监控的巨鲸钱包地址")
+        st.info("请在左侧按 `链,地址,备注` 的格式，添加你想监控的巨鲸钱包地址，或者用上面的快速添加")
     else:
         if st.button("📋 生成今日报告", key="refresh_whale", type="primary"):
             st.cache_data.clear()
 
         @st.cache_data(ttl=180)
-        def get_whale_data(wallets_tuple, api_key):
+        def get_whale_data(wallets_tuple, api_key, known_tuple):
             wallets_list = [dict(zip(["chain", "address", "label"], w)) for w in wallets_tuple]
-            return core.monitor_whale_wallets(wallets_list, api_key)
+            known_dict = dict(known_tuple)
+            return core.monitor_whale_wallets(wallets_list, api_key, known_addresses=known_dict)
 
         wallets_tuple = tuple((w["chain"], w["address"], w["label"]) for w in wallets)
-        with st.spinner("正在查询链上活动、识别对手方地址类型，可能需要十几秒..."):
-            whale_results = get_whale_data(wallets_tuple, etherscan_key)
+        known_tuple = tuple(known_addresses.items())
+        with st.spinner("正在查询链上活动、过滤垃圾代币、识别对手方地址类型，可能需要十几秒..."):
+            whale_results = get_whale_data(wallets_tuple, etherscan_key, known_tuple)
 
         for w in whale_results:
             with st.container(border=True):
@@ -503,10 +535,12 @@ with tab4:
                     continue
 
                 if not w.get("has_activity"):
-                    st.caption(f"{w.get('date','今天')} 没有代币转账记录")
+                    spam_note = f"（已过滤 {w['spam_filtered']} 笔疑似垃圾空投代币）" if w.get("spam_filtered") else ""
+                    st.caption(f"{w.get('date','今天')} 没有代币转账记录{spam_note}")
                     continue
 
-                st.caption(f"{w['date']}　共 {w['tx_count']} 笔代币转账")
+                spam_note = f"　（已过滤 {w['spam_filtered']} 笔疑似垃圾空投代币）" if w.get("spam_filtered") else ""
+                st.caption(f"{w['date']}　共 {w['tx_count']} 笔有效代币转账{spam_note}")
 
                 st.markdown("**📊 今日净流入/流出（按代币聚合）**")
                 for sym, flow in w["token_flows"].items():
@@ -520,7 +554,7 @@ with tab4:
                 if w.get("hypothesis"):
                     st.markdown("**🔍 主要交易对手方分析**")
                     for h in w["hypothesis"]:
-                        icon = "📜" if h["type"] == "合约" else ("👛" if h["type"] == "普通钱包" else "❔")
+                        icon = {"合约": "📜", "普通钱包": "👛", "已知地址": "🏷️"}.get(h["type"], "❔")
                         st.write(f"{icon} `{h['short']}`（{h['tx_count']}笔）")
                         st.caption(h["note"])
 
@@ -537,7 +571,7 @@ with tab4:
                             f"[查看交易](https://{explorer_domain}/tx/{tx['hash']})"
                         )
 
-        st.caption("⚠️ 净流入/流出是客观计算出来的事实；对手方分析是基于合约验证信息的推测方向，不是确定结论，请点交易链接自行核实后再做判断")
+        st.caption("⚠️ 净流入/流出是客观计算出来的事实；对手方分析是基于合约验证信息+你自己维护的地址库的推测方向，不是确定结论，请点交易链接自行核实后再做判断")
 
 
 # ---------- Tab 5: 信号回测 ----------
